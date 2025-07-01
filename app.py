@@ -2336,7 +2336,7 @@ st.markdown("""
         <a href="https://www.linkedin.com/in/ndiaye-bacar-b92aa555/" class="footer-link" target="_blank">
             <span class="footer-icon">👤</span> Bacar NDIAYE
         </a>
-        <a href="https://github.com/nomutilisateur/nom-repository" class="footer-link" target="_blank">
+        <a href="https://github.com/selinablkl/st_Accident" class="footer-link" target="_blank">
             <span class="footer-icon">💻</span> GitHub Repository
         </a>
     </div>
