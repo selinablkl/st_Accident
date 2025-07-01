@@ -25,12 +25,10 @@ joblib==1.3.2
 jsonschema==4.24.0
 jsonschema-specifications==2025.4.1
 kiwisolver==1.4.7
-llvmlite==0.43.0
 markdown-it-py==3.0.0
 MarkupSafe==3.0.2
 matplotlib==3.8.2
 mdurl==0.1.2
-numba==0.60.0
 numpy==1.26.2
 packaging==23.2
 pandas==2.1.3
@@ -52,7 +50,7 @@ rpds-py==0.25.1
 scikit-learn==1.3.2
 scipy==1.13.1
 seaborn==0.13.0
-shap==0.44.0
+shap==0.44.0[plots]
 shapely==2.0.7
 six==1.17.0
 slicer==0.0.7
