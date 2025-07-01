@@ -97,12 +97,9 @@ Thumbs.db
 # models/*.pt
 # models/*.pth
 
-# Data files (too large for GitHub without LFS)
-data/*.csv
-communes-20220101-shp/*.shp
-
-# Large model files
-models/*shap*.pkl
+# Data files (optional - uncomment if files are too large or sensitive)
+# data/*.csv
+# *.csv
 
 # SHAP values (optional - uncomment if regenerated frequently)
 # *shap*.pkl
