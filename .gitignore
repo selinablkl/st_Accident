@@ -1,0 +1,109 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+st_venv/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# pyenv
+.python-version
+
+# Environments
+.env
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+.temp/
+.tmp/
+
+# Claude configuration
+.claude/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Machine Learning Models (optional - uncomment if you don't want to track models)
+# models/*.pkl
+# models/*.pickle
+# models/*.h5
+# models/*.pt
+# models/*.pth
+
+# Data files (too large for GitHub without LFS)
+data/*.csv
+communes-20220101-shp/*.shp
+
+# Large model files
+models/*shap*.pkl
+
+# SHAP values (optional - uncomment if regenerated frequently)
+# *shap*.pkl
+# *shap*.pickle
