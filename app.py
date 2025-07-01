@@ -8,34 +8,204 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
-from typing import Tuple, List, Dict, Any, Union
+from typing import Tuple, List, Dict, Any, Union, Optional
 from sklearn.preprocessing import StandardScaler
 import shap
 import joblib
 import os
+import gc  # Garbage collection for memory management
+import warnings
+warnings.filterwarnings('ignore')
+
+# Memory optimization settings
+pd.options.mode.chained_assignment = None  # Disable the SettingWithCopyWarning
+
+def get_memory_usage():
+    """Retourne l'utilisation mémoire actuelle en MB."""
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    except (ImportError, NameError):
+        # If psutil is not available, return 0
+        return 0
+
+def log_memory_usage(operation_name: str):
+    """Log l'utilisation mémoire pour une opération donnée."""
+    memory_mb = get_memory_usage()
+    if memory_mb > 0:  # Only log if we could get memory usage
+        print(f"{operation_name}: {memory_mb:.2f} MB")
+
+def cleanup_memory():
+    """Nettoie la mémoire en forçant le garbage collection."""
+    gc.collect()
+    
+    # Pour les DataFrames volumineux, on peut aussi libérer le cache Streamlit si nécessaire
+    # st.cache_data.clear()  # Décommenter si besoin de libérer tout le cache
+
+def monitor_memory(func):
+    """Décorateur pour surveiller l'utilisation mémoire d'une fonction."""
+    def wrapper(*args, **kwargs):
+        # Mémoire avant
+        mem_before = get_memory_usage()
+        
+        # Exécuter la fonction
+        result = func(*args, **kwargs)
+        
+        # Mémoire après
+        mem_after = get_memory_usage()
+        
+        # Log la différence
+        diff = mem_after - mem_before
+        if diff > 10:  # Log seulement si la différence est significative (>10 MB)
+            print(f"{func.__name__}: +{diff:.2f} MB (total: {mem_after:.2f} MB)")
+        
+        return result
+    return wrapper
+
+def estimate_dataframe_memory(filepath: str, sep: str = ",") -> float:
+    """
+    Estime l'utilisation mémoire d'un DataFrame avant de le charger complètement.
+    
+    Args:
+        filepath: Chemin vers le fichier CSV
+        sep: Séparateur de colonnes
+        
+    Returns:
+        Estimation de la mémoire en MB
+    """
+    # Lire seulement les 1000 premières lignes pour estimer
+    sample = pd.read_csv(filepath, sep=sep, nrows=1000)
+    
+    # Calculer la mémoire par ligne
+    memory_per_row = sample.memory_usage(deep=True).sum() / len(sample) / 1024 / 1024
+    
+    # Compter le nombre total de lignes (rapide, ne charge pas le fichier)
+    with open(filepath, 'r') as f:
+        total_rows = sum(1 for _ in f) - 1  # -1 pour l'en-tête
+    
+    # Estimer la mémoire totale
+    estimated_memory = memory_per_row * total_rows
+    
+    return estimated_memory
+
+def read_csv_optimized(filepath: str, sep: str = ",", chunksize: int = 10000) -> pd.DataFrame:
+    """
+    Lit un fichier CSV par chunks pour optimiser la mémoire.
+    
+    Args:
+        filepath: Chemin vers le fichier CSV
+        sep: Séparateur de colonnes
+        chunksize: Taille des chunks
+    
+    Returns:
+        DataFrame complet optimisé
+    """
+    chunks = []
+    
+    # Lire le fichier par chunks
+    for chunk in pd.read_csv(filepath, sep=sep, chunksize=chunksize, low_memory=False):
+        # Optimiser chaque chunk
+        chunk = optimize_dtypes(chunk)
+        chunks.append(chunk)
+    
+    # Concaténer tous les chunks
+    df = pd.concat(chunks, ignore_index=True)
+    
+    # Libérer la mémoire des chunks
+    del chunks
+    gc.collect()
+    
+    return df
+
+def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Optimise les types de données d'un DataFrame pour réduire l'utilisation mémoire.
+    
+    Args:
+        df: DataFrame à optimiser
+    
+    Returns:
+        DataFrame avec types optimisés
+    """
+    for col in df.columns:
+        col_type = df[col].dtype
+        
+        # Optimisation des entiers
+        if col_type != 'object':
+            c_min = df[col].min()
+            c_max = df[col].max()
+            
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)
+            
+            # Optimisation des flottants
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+        
+        # Optimisation des chaînes de caractères avec category
+        else:
+            num_unique_values = len(df[col].unique())
+            num_total_values = len(df[col])
+            if num_unique_values / num_total_values < 0.5:
+                df[col] = df[col].astype('category')
+    
+    return df
+
+def get_dataset_columns(dataset_name: str) -> Optional[List[str]]:
+    """
+    Retourne les colonnes importantes pour chaque dataset.
+    Permet de charger seulement les colonnes nécessaires.
+    """
+    columns_dict = {
+        "accidents": [
+            'date', 'heure', 'departement', 'num_commune', 'luminosite', 
+            'conditions_atmos', 'type_collision', 'etat_surface', 'an_sem', 'annee',
+            'mois', 'jr_sem_q', 'tranche_heure', 'gravite_accident',
+            'latitude', 'longitude'
+        ],
+        # Ajouter d'autres datasets si nécessaire
+    }
+    return columns_dict.get(dataset_name, None)
 
 @st.cache_data
-def load_data(dataset_names: List[str] = None) -> Dict[str, Union[pd.DataFrame, gpd.GeoDataFrame]]:
+def load_data(dataset_names: Optional[List[str]] = None, optimize_memory: bool = True, use_columns: Optional[Dict[str, List[str]]] = None) -> Dict[str, Union[pd.DataFrame, gpd.GeoDataFrame]]:
     """
     Charge les données nécessaires de manière optimisée.
     
     Args:
         dataset_names: Liste des noms de datasets à charger. Si None, charge tous les datasets.
+        optimize_memory: Si True, optimise les types de données pour réduire la mémoire.
+        use_columns: Dict optionnel spécifiant les colonnes à charger pour chaque dataset.
     
     Returns:
         Un dictionnaire contenant les datasets demandés.
     """
     path = "./data/"
     
-    # Définir tous les datasets disponibles
+    # Définir tous les datasets disponibles avec optimisation mémoire
+    # Pour les gros fichiers comme accidents, on peut utiliser des chunks
     all_datasets = {
-        "X_train": lambda: pd.read_csv(path + "X_train.csv"),
-        "X_test": lambda: pd.read_csv(path + "X_test.csv"),
-        "y_train": lambda: pd.read_csv(path + "y_train.csv"),
-        "y_test": lambda: pd.read_csv(path + "y_test.csv"),
-        "dep": lambda: pd.read_csv(path + "departements-france.csv"),
-        "accidents": lambda: pd.read_csv(path + "20241031_accidents_Fr_19_22_AH_q.csv", sep=";"),
-        "france": lambda: gpd.read_file("./communes-20220101-shp/communes-20220101.shp")
+        "X_train": lambda cols=None: pd.read_csv(path + "X_train.csv", low_memory=False, usecols=cols),
+        "X_test": lambda cols=None: pd.read_csv(path + "X_test.csv", low_memory=False, usecols=cols),
+        "y_train": lambda cols=None: pd.read_csv(path + "y_train.csv", low_memory=False, usecols=cols),
+        "y_test": lambda cols=None: pd.read_csv(path + "y_test.csv", low_memory=False, usecols=cols),
+        "dep": lambda cols=None: pd.read_csv(path + "departements-france.csv", low_memory=False, usecols=cols),
+        "accidents": lambda cols=None: read_csv_optimized(path + "20241031_accidents_Fr_19_22_AH_q.csv", sep=";") if cols is None 
+                                      else pd.read_csv(path + "20241031_accidents_Fr_19_22_AH_q.csv", sep=";", usecols=cols, low_memory=False),
+        "france": lambda cols=None: gpd.read_file("./communes-20220101-shp/communes-20220101.shp") if cols is None else gpd.read_file("./communes-20220101-shp/communes-20220101.shp")
     }
     
     # Si aucun dataset spécifique n'est demandé, charger tous les datasets
@@ -46,7 +216,25 @@ def load_data(dataset_names: List[str] = None) -> Dict[str, Union[pd.DataFrame, 
     result = {}
     for name in dataset_names:
         if name in all_datasets:
-            result[name] = all_datasets[name]()
+            # Déterminer les colonnes à charger
+            cols = None
+            if use_columns and name in use_columns:
+                cols = use_columns[name]
+            elif optimize_memory and name == "accidents":
+                # Utiliser les colonnes par défaut pour accidents si optimize_memory est True
+                cols = get_dataset_columns("accidents")
+            
+            # Charger le dataset avec les colonnes spécifiées
+            df = all_datasets[name](cols)
+            
+            # Optimiser la mémoire si demandé (ne pas optimiser les GeoDataFrames)
+            if optimize_memory and isinstance(df, pd.DataFrame) and not isinstance(df, gpd.GeoDataFrame):
+                df = optimize_dtypes(df)
+            
+            result[name] = df
+    
+    # Force garbage collection après chargement
+    gc.collect()
     
     return result
 
@@ -56,13 +244,13 @@ def prepare_dep_accidents(accidents: pd.DataFrame, dep: pd.DataFrame) -> pd.Data
     return accidents.merge(dep, left_on="departement", right_on="code_departement", how="left")
 
 @st.cache_data
-def prepare_france_data(_france: gpd.GeoDataFrame, count: pd.DataFrame) -> gpd.GeoDataFrame:
+def prepare_france_data(_france: gpd.GeoDataFrame, count: pd.DataFrame) -> pd.DataFrame:
     """Prépare les données géospatiales de la France."""
     france_merged = _france.merge(count, left_on="insee", right_on="num_commune", how="left")
     return france_merged[france_merged['insee'] < '96000']
 
 @st.cache_data
-def get_top_communes(_france_data: gpd.GeoDataFrame, n: int = 1000) -> gpd.GeoDataFrame:
+def get_top_communes(_france_data: pd.DataFrame, n: int = 1000) -> pd.DataFrame:
     """Récupère les N communes avec le plus d'accidents."""
     top_communes = _france_data.nlargest(n, 'count')
     top_communes['count'] = top_communes['count'].round(1)
@@ -82,7 +270,7 @@ def prepare_accidents_binaire(_accidents: pd.DataFrame) -> pd.DataFrame:
     return accidents_binaire
 
 @st.cache_data
-def prepare_time_series_data(_accidents: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def prepare_time_series_data(_accidents: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Prépare les données pour les analyses temporelles."""
     accidents_dt = _accidents.copy()
     accidents_dt['date'] = pd.to_datetime(accidents_dt['date'], format='%d/%m/%Y', dayfirst=True)
@@ -92,10 +280,12 @@ def prepare_time_series_data(_accidents: pd.DataFrame) -> Tuple[pd.DataFrame, pd
     accidents_dt['month'] = accidents_dt['date'].dt.month
     
     # Compter le nombre d'accidents par année
-    accidents_per_year = accidents_dt.groupby('year').size().reset_index(name='nombre_accidents')
+    accidents_per_year = accidents_dt.groupby('year').size().reset_index()
+    accidents_per_year.columns = ['year', 'nombre_accidents']
     
     # Compter le nombre d'accidents par mois et par année
-    monthly_accidents = accidents_dt.groupby(['year', 'month']).size().reset_index(name='nombre_accidents')
+    monthly_accidents = accidents_dt.groupby(['year', 'month']).size().reset_index()
+    monthly_accidents.columns = ['year', 'month', 'nombre_accidents']
     
     # Ajouter les noms des mois
     month_names = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 
@@ -106,15 +296,22 @@ def prepare_time_series_data(_accidents: pd.DataFrame) -> Tuple[pd.DataFrame, pd
     accidents_dt['sem_ms_an'] = accidents_dt['date'].dt.isocalendar().week
     
     # Grouper par année et numéro de semaine pour compter le nombre d'accidents par semaine
-    accidents_per_week = accidents_dt.groupby([accidents_dt['year'], 'sem_ms_an']).size().reset_index(name='accidents_par_sem_an')
+    accidents_per_week = accidents_dt.groupby([accidents_dt['year'], 'sem_ms_an']).size().reset_index()
+    accidents_per_week.columns = ['year', 'sem_ms_an', 'accidents_par_sem_an']
     
-    return accidents_dt, monthly_accidents, accidents_per_week
+    return accidents_dt, monthly_accidents, accidents_per_week, accidents_per_year
 
 # Initialisation des données communes à toutes les pages
 if 'initialized' not in st.session_state:
-    # Chargement minimal des données au démarrage - seulement accidents
-    data_dict = load_data(["accidents"])
+    # Log mémoire au démarrage
+    log_memory_usage("Démarrage de l'application")
+    
+    # Chargement minimal des données au démarrage - seulement accidents avec optimisation
+    data_dict = load_data(["accidents"], optimize_memory=True)
     accidents = data_dict["accidents"]
+    
+    # Log mémoire après chargement
+    log_memory_usage("Après chargement des accidents")
     
     # Préparation des données binaires (utilisées dans plusieurs pages)
     accidents_binaire = prepare_accidents_binaire(accidents)
@@ -123,12 +320,29 @@ if 'initialized' not in st.session_state:
     st.session_state.accidents = accidents
     st.session_state.accidents_binaire = accidents_binaire
     st.session_state.initialized = True
+    
+    # Nettoyage mémoire après initialisation
+    cleanup_memory()
+    log_memory_usage("Après initialisation et nettoyage")
 else:
     # Récupération des données déjà chargées
     accidents = st.session_state.accidents
     accidents_binaire = st.session_state.accidents_binaire
 
 ######################### Streamlit app #########################
+
+# Afficher l'utilisation mémoire dans la sidebar (optionnel)
+with st.sidebar:
+    if st.checkbox("Afficher l'utilisation mémoire", value=False):
+        memory_mb = get_memory_usage()
+        st.metric("Mémoire utilisée", f"{memory_mb:.1f} MB")
+        
+        # Bouton pour nettoyer la mémoire
+        if st.button("Nettoyer la mémoire"):
+            cleanup_memory()
+            st.success("Mémoire nettoyée!")
+            st.rerun()
+
 selected = option_menu(
     menu_title=None,
     options=["Introduction", "Exploration", "Visualisation", "Modélisation", "Conclusion", "Chat"],
@@ -326,7 +540,7 @@ if selected == "Exploration":  # Exploration
     
     # Charger les données départementales si nécessaire
     if 'dep' not in st.session_state:
-        dep_dict = load_data(["dep"])
+        dep_dict = load_data(["dep"], optimize_memory=True)
         st.session_state.dep = dep_dict["dep"]
     dep = st.session_state.dep
     
@@ -451,7 +665,7 @@ if selected == "Exploration":  # Exploration
 
     # Préparation des données temporelles si nécessaire
     if 'time_series_data' not in st.session_state:
-        accidents_dt, monthly_accidents, accidents_per_week = prepare_time_series_data(accidents)
+        accidents_dt, monthly_accidents, accidents_per_week, accidents_per_year = prepare_time_series_data(accidents)
         st.session_state.accidents_dt = accidents_dt
         st.session_state.monthly_accidents = monthly_accidents
         st.session_state.accidents_per_week = accidents_per_week
@@ -479,7 +693,8 @@ if selected == "Exploration":  # Exploration
     st.markdown('<div class="title">📈 Évolution des accidents par année</div>', unsafe_allow_html=True)
     
     # Compter le nombre d'accidents par année
-    accidents_per_year = accidents_dt.groupby('year').size().reset_index(name='nombre_accidents')
+    accidents_per_year = accidents_dt.groupby('year').size().reset_index()
+    accidents_per_year.columns = ['year', 'nombre_accidents']
     
     # Créer un graphique interactif avec Plotly
     fig_yearly = px.bar(
@@ -657,7 +872,8 @@ if selected == "Exploration":  # Exploration
     
     # Préparation des données pour la carte
     # Compter le nombre d'accidents par département et par année
-    dep_year_accidents = accidents_dt.groupby(['year', 'departement']).size().reset_index(name='nombre_accidents')
+    dep_year_accidents = accidents_dt.groupby(['year', 'departement']).size().reset_index()
+    dep_year_accidents.columns = ['year', 'departement', 'nombre_accidents']
     
     # Obtenir les années disponibles dans les données
     available_years = sorted(dep_year_accidents['year'].unique())
@@ -806,15 +1022,22 @@ if selected == "Exploration":  # Exploration
 
     # Chargement des données nécessaires uniquement pour cette page
     if 'france' not in st.session_state:
-        data_dict = load_data(["france"])
+        # Log mémoire avant chargement des données géospatiales
+        log_memory_usage("Avant chargement des données géospatiales")
+        
+        data_dict = load_data(["france"], optimize_memory=True)
         st.session_state.france = data_dict["france"]
+        
+        # Log mémoire après chargement
+        log_memory_usage("Après chargement des données géospatiales")
     
     france = st.session_state.france
     
     # Préparation des données pour l'affichage
     if 'top_1000_communes' not in st.session_state:
         # Nombre d'accident par département
-        count = accidents.groupby("num_commune").size().reset_index(name="count")
+        count = accidents.groupby("num_commune").size().reset_index()
+        count.columns = ["num_commune", "count"]
         
         # Fusionner les données géospatiales avec les données d'accidents
         france_data = prepare_france_data(france, count)
@@ -876,7 +1099,8 @@ if selected == "Exploration":  # Exploration
     # Préparation des données pour l'analyse de gravité
     @st.cache_data
     def prepare_gravity_data(_accidents_dt):
-        gravity_year = _accidents_dt.groupby(['year', 'gravite_accident']).size().reset_index(name='nombre_accidents')
+        gravity_year = _accidents_dt.groupby(['year', 'gravite_accident']).size().reset_index()
+        gravity_year.columns = ['year', 'gravite_accident', 'nombre_accidents']
         
         # Créer un mapping pour les niveaux de gravité
         gravity_mapping = {
@@ -1020,7 +1244,11 @@ if selected == "Visualisation":  # DataVisualisation
     st.session_state.image_index = image_index
 
     # Affichage de l'image sélectionnée
-    st.image(load_image(image_index))
+    image_path = load_image(image_index)
+    if image_path:
+        st.image(image_path)
+    else:
+        st.error("Image non trouvée")
 
     # Boutons de navigation
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -1064,997 +1292,1340 @@ if selected == "Visualisation":  # DataVisualisation
 
 if selected == "Modélisation":  # Modélisation 
     
-    # Ajout d'un style CSS pour améliorer l'apparence (même style que l'introduction et la conclusion)
-    st.markdown("""
-    <style>
-        .main-title {
-            color: #1E3A8A;
-            font-size: 36px;
-            font-weight: 700;
-            text-align: center;
-            margin-bottom: 30px;
-            padding-bottom: 15px;
-            border-bottom: 2px solid #3B82F6;
-            text-shadow: 1px 1px 2px rgba(0,0,0,0.1);
-        }
-        .title-container {
-            background: linear-gradient(to right, #f0f4ff, #ffffff, #f0f4ff);
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 40px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
-        }
-        .model-header {
-            color: #1E3A8A;
-            font-size: 28px;
-            font-weight: 600;
-            margin-bottom: 20px;
-        }
-        .intro-header {
-            color: #1E3A8A;
-            font-size: 28px;
-            font-weight: 600;
-            margin-bottom: 20px;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # Titre principal amélioré avec conteneur
-    st.markdown("""
-    <div class="title-container">
-        <div class="main-title">Modélisation Prédictive</div>
-        <div style="text-align: center; font-size: 20px; color: #4B5563; font-weight: 500;">Prédiction de la gravité des accidents</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Méthodologie
-
-    st.markdown("<div class='intro-header'>La démarche méthodologique 'en entonnoir'</div>", unsafe_allow_html=True)
-
-    st.markdown("""
-
-    La démarche retenue consiste à partir d'une liste de 8 modèles, de les hiérarchiser sur la base de leurs performances de bonne classification des observations du jeu de données de l'ensemble de test.
-    Cette démarche se décline de la façon suivante :
-    1. Entrainement de 8 modèles sans rééquilibrage des modalités de la cible (à 4 modalités ou binaire). Les modèles sont évalués et hiérarchisés sur la base de la métrique « F1_score » de la modalité « positive » (« tué » dans le cas à 4 modalités ou « blessé_tué » après binarisation).
-    2. Les 4 modèles les plus performants ont ensuite été réentraînés en rééquilibrant les modalités de la cible (multinomiale ou binaire) : une hiérarchisation de leurs performances a été effectuée sur le même principe que ci-dessus.
-    3. Nous avons ensuite retenu les 3 modèles les plus performants, du point précédent, pour les optimiser à l'aide de « GridSearchCV » et identifié les valeurs optimales des hyperparamètres de chacun des 3 modèles du podium.
-    """)
-
-    st.image("./images/20250305_Funnel_Cible-Multi_01.jpg", caption='Démarche en entonnoir : cible multinomiale')
-
-    st.image("./images/20250305_Funnel_Cible-Binaire_01.jpg", caption='Démarche en entonnoir : cible binaire')
-    st.markdown("""
-
-    Dans ce qui suit, seuls les résultats de modélisation de la cible binaire seront présentés.
-
-    """)
-
-    # Chargement des données nécessaires pour la modélisation si elles ne sont pas déjà chargées
-    if 'X_train' not in st.session_state:
-        data_dict = load_data(["X_train", "X_test", "y_train", "y_test"])
-        st.session_state.X_train = data_dict["X_train"]
-        st.session_state.X_test = data_dict["X_test"]
-        st.session_state.y_train = data_dict["y_train"]
-        st.session_state.y_test = data_dict["y_test"]
-    
-    # Création d'une nouvelle colonne avec des labels explicites
-    accidents_binaire['gravite_accident_label'] = accidents_binaire['gravite_accident'].replace({
-        '0': 'Indemne',
-        '1': 'Blessé/Tué'
-    })
-
-    # Création du graphique
-    @st.cache_data
-    def create_countplot():
-        fig, ax = plt.subplots(figsize=(8, 4))
+    # Wrapper try-except pour toute la section de modélisation
+    try:
+        # Vérification de la mémoire disponible au début
+        try:
+            import psutil
+            available_memory = psutil.virtual_memory().available / (1024 * 1024 * 1024)  # GB
+            total_memory = psutil.virtual_memory().total / (1024 * 1024 * 1024)  # GB
+            memory_percent = psutil.virtual_memory().percent
+            
+            # Avertir si la mémoire disponible est faible
+            if available_memory < 2:  # Moins de 2GB disponible
+                st.warning(f"⚠️ Mémoire disponible faible : {available_memory:.1f} GB sur {total_memory:.1f} GB ({memory_percent:.1f}% utilisé)")
+                st.info("💡 Les données seront optimisées pour réduire l'utilisation mémoire.")
+                
+                # Si la mémoire est vraiment critique, proposer de nettoyer le cache
+                if available_memory < 1:  # Moins de 1GB disponible
+                    if st.button("🧹 Nettoyer le cache pour libérer de la mémoire"):
+                        st.cache_data.clear()
+                        cleanup_memory()
+                        st.success("✅ Cache nettoyé. Veuillez rafraîchir la page.")
+                        st.stop()
+        except ImportError:
+            pass  # psutil n'est pas installé, on continue sans vérification
         
-        # Affichage du graphique avec les nouvelles étiquettes
-        sns.countplot(data=accidents_binaire,
-                    x='gravite_accident_label',
-                    hue='gravite_accident_label',
-                    palette='Blues',
-                    order=['Indemne', 'Blessé/Tué'],  # Assure l'ordre souhaité
-                    ax=ax,
-                    legend=False)
-
-        # Ajout des pourcentages
-        total = len(accidents_binaire)
-        for p in ax.patches:
-            percentage = f"{100 * p.get_height() / total:.1f}%"
-            ax.annotate(percentage, 
-                        (p.get_x() + p.get_width() / 2, p.get_height()), 
-                        ha='center', va='bottom', fontsize=12, color='black')
-
-        # Titre stylisé
-        plt.title("Distribution de la gravité des accidents\n",
-                loc="center", fontsize=16, fontweight='bold', color="black")
-
-        plt.xlabel("Gravité de l'accident")
-        plt.ylabel("Nombre d'accidents")
-        return fig
+        # Log mémoire avant le début de la modélisation
+        log_memory_usage("Début de la section Modélisation")
     
-    # Afficher le graphique
-    fig = create_countplot()
-    st.pyplot(fig)
+        # Ajout d'un style CSS pour améliorer l'apparence (même style que l'introduction et la conclusion)
+        st.markdown("""
+        <style>
+            .main-title {
+                color: #1E3A8A;
+                font-size: 36px;
+                font-weight: 700;
+                text-align: center;
+                margin-bottom: 30px;
+                padding-bottom: 15px;
+                border-bottom: 2px solid #3B82F6;
+                text-shadow: 1px 1px 2px rgba(0,0,0,0.1);
+            }
+            .title-container {
+                background: linear-gradient(to right, #f0f4ff, #ffffff, #f0f4ff);
+                padding: 20px;
+                border-radius: 10px;
+                margin-bottom: 40px;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            }
+            .model-header {
+                color: #1E3A8A;
+                font-size: 28px;
+                font-weight: 600;
+                margin-bottom: 20px;
+            }
+            .intro-header {
+                color: #1E3A8A;
+                font-size: 28px;
+                font-weight: 600;
+                margin-bottom: 20px;
+            }
+        </style>
+        """, unsafe_allow_html=True)
     
-    # Afficher le commentaire sous le graphique SEULEMENT
-    st.markdown(
-        """
-        <div style="background-color:#f9f9f9; padding:10px; border-radius:5px; border-left:5px solid #007BFF;">
-            <b>📌 Analyse du graphique :</b>  
-            Ce graphique illustre la <b>distribution de la gravité des accidents</b> en France entre <b>2019 et 2022</b>.  
-            On observe une différence notable entre les accidents <b>légers</b> et ceux <b>graves/mortels</b>,  
-            avec une proportion plus importante d'accidents légers. Cette tendance met en évidence  
-            la nécessité de renforcer les mesures de sécurité pour réduire la sévérité des accidents.
+        # Titre principal amélioré avec conteneur
+        st.markdown("""
+        <div class="title-container">
+            <div class="main-title">Modélisation Prédictive</div>
+            <div style="text-align: center; font-size: 20px; color: #4B5563; font-weight: 500;">Prédiction de la gravité des accidents</div>
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        """, unsafe_allow_html=True)
+    
+        # Méthodologie
 
-    # Standardiser les variables 'latitude' et 'longitude' dans X_train et X_test si ce n'est pas déjà fait
-    if 'standardized' not in st.session_state:
-        scaler = StandardScaler()
-        st.session_state.X_train[['latitude', 'longitude']] = scaler.fit_transform(st.session_state.X_train[['latitude', 'longitude']])
-        st.session_state.X_test[['latitude', 'longitude']] = scaler.transform(st.session_state.X_test[['latitude', 'longitude']])
-        st.session_state.standardized = True
+        st.markdown("<div class='intro-header'>La démarche méthodologique 'en entonnoir'</div>", unsafe_allow_html=True)
 
-    # Transformer la cible 'gravite_accident' dans y_train et y_test si ce n'est pas déjà fait
-    if 'target_transformed' not in st.session_state:
-        def transform_target(y):
-            return y.replace({
-                'indemne': 'indemne',
-                'blesse_leger': 'blesse_tue',
-                'blesse_hospitalise': 'blesse_tue',
-                'tue': 'blesse_tue'
-            })
+        st.markdown("""
 
-        st.session_state.y_train = transform_target(st.session_state.y_train)
-        st.session_state.y_test = transform_target(st.session_state.y_test)
-        st.session_state.target_transformed = True
+        La démarche retenue consiste à partir d'une liste de 8 modèles, de les hiérarchiser sur la base de leurs performances de bonne classification des observations du jeu de données de l'ensemble de test.
+        Cette démarche se décline de la façon suivante :
+        1. Entrainement de 8 modèles sans rééquilibrage des modalités de la cible (à 4 modalités ou binaire). Les modèles sont évalués et hiérarchisés sur la base de la métrique « F1_score » de la modalité « positive » (« tué » dans le cas à 4 modalités ou « blessé_tué » après binarisation).
+        2. Les 4 modèles les plus performants ont ensuite été réentraînés en rééquilibrant les modalités de la cible (multinomiale ou binaire) : une hiérarchisation de leurs performances a été effectuée sur le même principe que ci-dessus.
+        3. Nous avons ensuite retenu les 3 modèles les plus performants, du point précédent, pour les optimiser à l'aide de « GridSearchCV » et identifié les valeurs optimales des hyperparamètres de chacun des 3 modèles du podium.
+        """)
 
-    # Définir le chemin des fichiers
-    path = "./models/"
+        st.image("./images/20250305_Funnel_Cible-Multi_01.jpg", caption='Démarche en entonnoir : cible multinomiale')
 
-    # Fonction pour charger les modèles avec mise en cache
-    @st.cache_resource
-    def load_model(model_name: str) -> Any:
-        """
-        Charge un modèle à partir d'un fichier pickle avec mise en cache.
-        
-        Args:
-            model_name: Nom du modèle à charger (CatBoost, XGBoost)
-            
-        Returns:
-            Le modèle chargé
-        """
-        model_path = {
-            "CatBoost": "20250129_catboost_best_model.pkl",
-            "XGBoost": "20250129_xgb_best_model.pkl"
-        }
-        model_file = os.path.join(path, model_path[model_name])
-        
-        if os.path.exists(model_file):
-            return joblib.load(model_file)
-        else:
-            st.error(f"Le fichier {model_file} n'existe pas.")
-            return None
+        st.image("./images/20250305_Funnel_Cible-Binaire_01.jpg", caption='Démarche en entonnoir : cible binaire')
+        st.markdown("""
 
-    # Fonction pour charger les valeurs SHAP avec mise en cache
-    @st.cache_resource
-    def load_shap_values(model_name: str) -> Any:
-        """
-        Charge les valeurs SHAP précalculées à partir d'un fichier pickle.
-        
-        Args:
-            model_name: Nom du modèle (CatBoost, XGBoost)
-            
-        Returns:
-            Les valeurs SHAP ou None si le fichier n'existe pas
-        """
-        shap_path = {
-            "CatBoost": "20250304_catboost_bin_best_shap_values.pkl",
-            "XGBoost": "20250304_XGBoost_bin_best_shap_values.pkl"
-        }
-        shap_file = os.path.join(path, shap_path[model_name])
-        
-        if os.path.exists(shap_file):
-            return joblib.load(shap_file)
-        else:
-            st.warning(f"Le fichier de valeurs SHAP {shap_file} n'existe pas. Les valeurs seront calculées à la volée.")
-            return None
+        Dans ce qui suit, seuls les résultats de modélisation de la cible binaire seront présentés.
 
-    # Fonction pour calculer les valeurs SHAP (sans mise en cache)
-    def calculate_shap_values(model: Any, X_test: pd.DataFrame, model_name: str) -> Any:
-        """
-        Calcule les valeurs SHAP à la volée.
-        
-        Args:
-            model: Modèle chargé
-            X_test: Données de test
-            model_name: Nom du modèle
-            
-        Returns:
-            Les valeurs SHAP calculées
-        """
-        try:
-            # Afficher des informations sur les données d'entrée
-            st.info(f"Calcul des valeurs SHAP pour {model_name} avec {X_test.shape[0]} exemples et {X_test.shape[1]} features")
-            
-            # Pour les modèles (CatBoost, XGBoost)
+        """)
+
+        # Chargement des données nécessaires pour la modélisation si elles ne sont pas déjà chargées
+        if 'X_train' not in st.session_state:
             try:
-                # Essayer d'abord avec l'explainer standard
-                explainer = shap.Explainer(model)
-                return explainer(X_test)
-            except Exception as e:
-                st.warning(f"Erreur avec l'Explainer standard: {str(e)}")
-                
+                # Log mémoire avant chargement des données d'entraînement
+                log_memory_usage("Avant chargement des données d'entraînement")
+            
+                # Charger les données avec optimisation mémoire
+                data_dict = load_data(["X_train", "X_test", "y_train", "y_test"], optimize_memory=True)
+            
+                # Vérifier si les données sont chargées correctement
+                if not all(key in data_dict for key in ["X_train", "X_test", "y_train", "y_test"]):
+                    st.error("❌ Erreur: Toutes les données nécessaires n'ont pas pu être chargées.")
+                    st.stop()
+            
+                # Limiter la taille des datasets pour la modélisation si nécessaire
+                # Ajuster les limites en fonction de la mémoire disponible
                 try:
-                    # Essayer avec TreeExplainer pour XGBoost
-                    if model_name == "XGBoost":
-                        st.info("Tentative avec TreeExplainer pour XGBoost...")
-                        tree_explainer = shap.TreeExplainer(model)
-                        return tree_explainer.shap_values(X_test)
-                except Exception:
-                    pass
-                
-                st.info("Tentative avec KernelExplainer...")
-                try:
-                    # Méthode alternative avec KernelExplainer
-                    sample_size = min(100, X_test.shape[0])
-                    X_sample = X_test.sample(sample_size) if X_test.shape[0] > sample_size else X_test
-                    
-                    background = shap.sample(X_sample, min(50, sample_size))
-                    if hasattr(model, 'predict_proba'):
-                        kernel_explainer = shap.KernelExplainer(model.predict_proba, background)
+                    if 'available_memory' in locals() and available_memory < 4:
+                        max_samples_train = 30000  # Limite réduite pour l'entraînement
+                        max_samples_test = 5000    # Limite réduite pour le test
                     else:
-                        kernel_explainer = shap.KernelExplainer(model.predict, background)
-                    return kernel_explainer.shap_values(X_sample)
-                except Exception as e2:
-                    st.error(f"Toutes les méthodes ont échoué: {str(e2)}")
-                    # Créer des valeurs SHAP factices
-                    dummy_values = np.random.normal(0, 0.01, (X_test.shape[0], X_test.shape[1]))
-                    return dummy_values
-        
-        except Exception as e:
-            st.error(f"Erreur générale lors du calcul des valeurs SHAP: {str(e)}")
-            # Retourner des valeurs factices pour éviter les erreurs
-            dummy_values = np.zeros((min(100, len(X_test)), len(X_test.columns)))
-            return dummy_values
-
-    # Fonction pour extraire directement les importances du modèle Random Forest
-    def get_feature_importances_rf(model, feature_names):
-        """
-        Extrait les importances directement du modèle Random Forest.
-        
-        Args:
-            model: Modèle Random Forest
-            feature_names: Noms des features
+                        max_samples_train = 50000  # Limite normale pour l'entraînement
+                        max_samples_test = 10000   # Limite normale pour le test
+                except:
+                    # Valeurs par défaut si on ne peut pas déterminer la mémoire
+                    max_samples_train = 50000
+                    max_samples_test = 10000
             
-        Returns:
-            DataFrame avec les importances triées
-        """
-        if not hasattr(model, 'feature_importances_'):
-            st.error("Le modèle ne possède pas d'attribut feature_importances_")
-            return None
-        
-        # Extraire les importances
-        importances = model.feature_importances_
-        
-        # Vérifier que les dimensions correspondent
-        if len(importances) != len(feature_names):
-            st.warning(f"Dimensions incorrectes: importances {len(importances)} vs features {len(feature_names)}")
-            # Ajuster si nécessaire
-            if len(importances) < len(feature_names):
-                # Compléter avec des zéros
-                importances = np.pad(importances, (0, len(feature_names) - len(importances)))
-            else:
-                # Tronquer
-                importances = importances[:len(feature_names)]
-        
-        # Créer un DataFrame
-        importance_df = pd.DataFrame({
-            'Feature': feature_names,
-            'Importance': importances
-        })
-        
-        # Trier par importance décroissante
-        importance_df = importance_df.sort_values('Importance', ascending=False)
-        
-        return importance_df
-
-    # Fonction pour créer les graphiques SHAP avec mise en cache
-    @st.cache_data
-    def create_importance_plot_rf(_shap_values_data, _feature_names, max_display=24, min_display=10):
-        """Crée un graphique d'importance des variables spécifiquement pour Random Forest."""
-        fig = plt.figure(figsize=(12, 8))  # Augmenter la taille pour plus de lisibilité
+                # Échantillonner si les datasets sont trop grands
+                if len(data_dict["X_train"]) > max_samples_train:
+                    st.info(f"📊 Dataset d'entraînement limité à {max_samples_train} échantillons pour optimiser les performances.")
+                    sample_indices = np.random.choice(len(data_dict["X_train"]), max_samples_train, replace=False)
+                    data_dict["X_train"] = data_dict["X_train"].iloc[sample_indices]
+                    data_dict["y_train"] = data_dict["y_train"].iloc[sample_indices]
+            
+                if len(data_dict["X_test"]) > max_samples_test:
+                    st.info(f"📊 Dataset de test limité à {max_samples_test} échantillons pour optimiser les performances.")
+                    sample_indices = np.random.choice(len(data_dict["X_test"]), max_samples_test, replace=False)
+                    data_dict["X_test"] = data_dict["X_test"].iloc[sample_indices]
+                    data_dict["y_test"] = data_dict["y_test"].iloc[sample_indices]
+            
+                # Stocker dans session_state
+                st.session_state.X_train = data_dict["X_train"]
+                st.session_state.X_test = data_dict["X_test"]
+                st.session_state.y_train = data_dict["y_train"]
+                st.session_state.y_test = data_dict["y_test"]
+            
+                # Log mémoire après chargement
+                log_memory_usage("Après chargement des données d'entraînement")
+            
+                # Nettoyer la mémoire
+                cleanup_memory()
+                del data_dict  # Libérer le dictionnaire temporaire
+            
+                # Vérifier à nouveau la mémoire après chargement
+                memory_after_load = get_memory_usage()
+                if memory_after_load > 1000:  # Plus de 1GB utilisé
+                    st.info(f"📊 Utilisation mémoire après chargement : {memory_after_load:.0f} MB")
+            
+            except MemoryError as e:
+                st.error("❌ Erreur de mémoire insuffisante lors du chargement des données.")
+                st.info("💡 Suggestions:")
+                st.info("• Fermez d'autres applications pour libérer de la mémoire")
+                st.info("• Rechargez la page")
+                st.info("• Contactez l'administrateur si le problème persiste")
+                st.stop()
+            except Exception as e:
+                st.error(f"❌ Erreur lors du chargement des données : {str(e)}")
+                cleanup_memory()  # Essayer de nettoyer même en cas d'erreur
+                st.stop()
+    
+        # Vérifier que accidents_binaire est disponible
+        if 'accidents_binaire' not in st.session_state:
+            st.error("❌ Les données accidents_binaire ne sont pas disponibles. Veuillez d'abord charger les données depuis la page d'Introduction.")
+            st.stop()
+    
+        accidents_binaire = st.session_state.accidents_binaire
+    
+        # Création d'une nouvelle colonne avec des labels explicites
         try:
-            # Convertir _feature_names en tableau NumPy
-            feature_names_array = np.array(_feature_names)
-            
-            # Pour Random Forest, nous utilisons une approche manuelle plus robuste
-            # Extraire les valeurs SHAP pour la classe positive (indice 1 pour classification binaire)
-            if len(_shap_values_data) > 1:  # S'il y a plusieurs classes
-                shap_values_to_use = _shap_values_data[1]  # Utiliser la classe positive
-            else:
-                shap_values_to_use = _shap_values_data[0]
-            
-            # Calculer l'importance des features (moyenne des valeurs absolues)
-            feature_importance = np.abs(shap_values_to_use).mean(0)
-            
-            # Créer un DataFrame pour le tri et l'affichage
-            importance_df = pd.DataFrame({
-                'Feature': feature_names_array,
-                'Importance': feature_importance
+            accidents_binaire['gravite_accident_label'] = accidents_binaire['gravite_accident'].replace({
+                '0': 'Indemne',
+                '1': 'Blessé/Tué'
             })
+        except Exception as e:
+            st.error(f"❌ Erreur lors de la création des labels : {str(e)}")
+            st.stop()
+
+        # Création du graphique
+        @st.cache_data
+        def create_countplot():
+            fig, ax = plt.subplots(figsize=(8, 4))
+        
+            # Affichage du graphique avec les nouvelles étiquettes
+            sns.countplot(data=accidents_binaire,
+                        x='gravite_accident_label',
+                        hue='gravite_accident_label',
+                        palette='Blues',
+                        order=['Indemne', 'Blessé/Tué'],  # Assure l'ordre souhaité
+                        ax=ax)
+            ax.legend().set_visible(False)  # Suppression de la légende
+
+            # Ajout des pourcentages
+            total = len(accidents_binaire)
+            for p in ax.patches:
+                percentage = f"{100 * p.get_height() / total:.1f}%"
+                ax.annotate(percentage, 
+                            (p.get_x() + p.get_width() / 2, p.get_height()), 
+                            ha='center', va='bottom', fontsize=12, color='black')
+
+            # Titre stylisé
+            plt.title("Distribution de la gravité des accidents\n",
+                    loc="center", fontsize=16, fontweight='bold', color="black")
+
+            plt.xlabel("Gravité de l'accident")
+            plt.ylabel("Nombre d'accidents")
+            return fig
+    
+        # Afficher le graphique
+        fig = create_countplot()
+        st.pyplot(fig)
+    
+        # Afficher le commentaire sous le graphique SEULEMENT
+        st.markdown(
+            """
+            <div style="background-color:#f9f9f9; padding:10px; border-radius:5px; border-left:5px solid #007BFF;">
+                <b>📌 Analyse du graphique :</b>  
+                Ce graphique illustre la <b>distribution de la gravité des accidents</b> en France entre <b>2019 et 2022</b>.  
+                On observe une différence notable entre les accidents <b>légers</b> et ceux <b>graves/mortels</b>,  
+                avec une proportion plus importante d'accidents légers. Cette tendance met en évidence  
+                la nécessité de renforcer les mesures de sécurité pour réduire la sévérité des accidents.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # Standardiser les variables 'latitude' et 'longitude' dans X_train et X_test si ce n'est pas déjà fait
+        if 'standardized' not in st.session_state:
+            scaler = StandardScaler()
+            st.session_state.X_train[['latitude', 'longitude']] = scaler.fit_transform(st.session_state.X_train[['latitude', 'longitude']])
+            st.session_state.X_test[['latitude', 'longitude']] = scaler.transform(st.session_state.X_test[['latitude', 'longitude']])
+            st.session_state.standardized = True
+
+        # Transformer la cible 'gravite_accident' dans y_train et y_test si ce n'est pas déjà fait
+        if 'target_transformed' not in st.session_state:
+            def transform_target(y):
+                return y.replace({
+                    'indemne': 'indemne',
+                    'blesse_leger': 'blesse_tue',
+                    'blesse_hospitalise': 'blesse_tue',
+                    'tue': 'blesse_tue'
+                })
+
+            st.session_state.y_train = transform_target(st.session_state.y_train)
+            st.session_state.y_test = transform_target(st.session_state.y_test)
+            st.session_state.target_transformed = True
+
+        # Définir le chemin des fichiers
+        path = "./models/"
+
+        # Fonction pour charger les modèles avec mise en cache
+        @st.cache_resource
+        def load_model(model_name: Optional[str]) -> Any:
+            """
+            Charge un modèle à partir d'un fichier pickle avec mise en cache.
+        
+            Args:
+                model_name: Nom du modèle à charger (CatBoost, XGBoost)
             
+            Returns:
+                Le modèle chargé
+            """
+            if model_name is None:
+                st.error("Le nom du modèle ne peut pas être None.")
+                return None
+            
+            model_path = {
+                "CatBoost": "20250129_catboost_best_model.pkl",
+                "XGBoost": "20250129_xgb_best_model.pkl"
+            }
+            
+            if model_name not in model_path:
+                st.error(f"Modèle inconnu: {model_name}")
+                return None
+                
+            model_file = os.path.join(path, model_path[model_name])
+        
+            if os.path.exists(model_file):
+                return joblib.load(model_file)
+            else:
+                st.error(f"Le fichier {model_file} n'existe pas.")
+                return None
+
+        # Fonction pour charger les valeurs SHAP avec mise en cache
+        @st.cache_resource
+        def load_shap_values(model_name: Optional[str]) -> Any:
+            """
+            Charge les valeurs SHAP précalculées à partir d'un fichier pickle.
+        
+            Args:
+                model_name: Nom du modèle (CatBoost, XGBoost)
+            
+            Returns:
+                Les valeurs SHAP ou None si le fichier n'existe pas
+            """
+            if model_name is None:
+                st.error("Le nom du modèle ne peut pas être None.")
+                return None
+            
+            shap_path = {
+                "CatBoost": "20250304_catboost_bin_best_shap_values.pkl",
+                "XGBoost": "20250304_XGBoost_bin_best_shap_values.pkl"
+            }
+            
+            if model_name not in shap_path:
+                st.error(f"Modèle inconnu: {model_name}")
+                return None
+                
+            shap_file = os.path.join(path, shap_path[model_name])
+        
+            if os.path.exists(shap_file):
+                return joblib.load(shap_file)
+            else:
+                st.warning(f"Le fichier de valeurs SHAP {shap_file} n'existe pas. Les valeurs seront calculées à la volée.")
+                return None
+
+        # Fonction pour calculer les valeurs SHAP (avec mise en cache optimisée)
+        @st.cache_data(ttl=3600, max_entries=5, show_spinner=False)
+        def calculate_shap_values(model: Any, X_test: pd.DataFrame, model_name: Optional[str], 
+                                 max_samples: int = 1000, memory_limit_mb: int = 500) -> Any:
+            """
+            Calcule les valeurs SHAP avec mise en cache et optimisation mémoire.
+        
+            Args:
+                model: Modèle chargé
+                X_test: Données de test
+                model_name: Nom du modèle
+                max_samples: Nombre maximum d'échantillons à traiter (par défaut 1000)
+                memory_limit_mb: Limite de mémoire en MB (par défaut 500)
+            
+            Returns:
+                Les valeurs SHAP calculées
+            """
+            if model_name is None:
+                st.error("Le nom du modèle ne peut pas être None.")
+                return None
+                
+            if model is None:
+                st.error("Le modèle ne peut pas être None.")
+                return None
+                
+            try:
+                # Vérifier la mémoire disponible
+                initial_memory = get_memory_usage()
+                if initial_memory > memory_limit_mb:
+                    st.warning(f"⚠️ Utilisation mémoire élevée ({initial_memory:.0f} MB). Nettoyage en cours...")
+                    cleanup_memory()
+                    # Fermer toutes les figures matplotlib ouvertes
+                    plt.close('all')
+                    # Attendre un peu pour que le GC fasse son travail
+                    import time
+                    time.sleep(0.5)
+            
+                # Limiter le nombre d'échantillons si nécessaire
+                n_samples = X_test.shape[0]
+                if n_samples > max_samples:
+                    st.info(f"📊 Échantillonnage des données: {max_samples} exemples sur {n_samples} pour optimiser les performances")
+                    X_test = X_test.sample(n=max_samples, random_state=42)
+            
+                # Afficher une barre de progression
+                progress_bar = st.progress(0)
+                progress_text = st.empty()
+            
+                progress_text.text(f"🔄 Initialisation du calcul SHAP pour {model_name}...")
+                progress_bar.progress(10)
+            
+                # Pour les modèles basés sur des arbres (CatBoost, XGBoost, RandomForest)
+                try:
+                    progress_text.text("🌳 Tentative avec TreeExplainer (méthode rapide)...")
+                    progress_bar.progress(30)
+                
+                    if model_name in ["XGBoost", "CatBoost", "Random Forest"]:
+                        explainer = shap.TreeExplainer(model)
+                    
+                        # Calculer les valeurs SHAP par batch pour économiser la mémoire
+                        batch_size = min(100, len(X_test))
+                        shap_values_list = []
+                    
+                        for i in range(0, len(X_test), batch_size):
+                            batch_end = min(i + batch_size, len(X_test))
+                            batch = X_test.iloc[i:batch_end]
+                        
+                            # Mise à jour de la progression
+                            progress = 30 + int(60 * (i + batch_size) / len(X_test))
+                            progress_bar.progress(min(progress, 90))
+                            progress_text.text(f"🔄 Calcul en cours... {i+1}-{batch_end}/{len(X_test)} exemples")
+                        
+                            # Calculer les valeurs SHAP pour ce batch
+                            batch_shap_values = explainer.shap_values(batch)
+                            shap_values_list.append(batch_shap_values)
+                        
+                            # Vérifier la mémoire après chaque batch
+                            current_memory = get_memory_usage()
+                            if current_memory > memory_limit_mb * 0.8:
+                                st.warning(f"⚠️ Mémoire proche de la limite ({current_memory:.0f} MB). Nettoyage...")
+                                cleanup_memory()
+                                # Si toujours trop élevé, réduire la taille du prochain batch
+                                if current_memory > memory_limit_mb * 0.9:
+                                    batch_size = max(10, batch_size // 2)
+                    
+                        # Concaténer tous les résultats
+                        if isinstance(shap_values_list[0], list):
+                            # Pour les modèles multi-classes
+                            shap_values = [np.vstack([batch[i] for batch in shap_values_list]) 
+                                         for i in range(len(shap_values_list[0]))]
+                        else:
+                            shap_values = np.vstack(shap_values_list)
+                    
+                        progress_bar.progress(100)
+                        progress_text.text("✅ Calcul SHAP terminé avec succès!")
+                        return shap_values
+                    
+                except Exception as e:
+                    st.warning(f"⚠️ TreeExplainer non disponible: {str(e)}")
+                
+                # Essayer avec l'explainer standard
+                try:
+                    progress_text.text("🔧 Tentative avec Explainer standard...")
+                    progress_bar.progress(40)
+                
+                    explainer = shap.Explainer(model)
+                    shap_values = explainer(X_test)
+                
+                    progress_bar.progress(100)
+                    progress_text.text("✅ Calcul SHAP terminé avec succès!")
+                    return shap_values
+                
+                except Exception as e:
+                    st.warning(f"⚠️ Explainer standard non disponible: {str(e)}")
+                
+                    # Méthode de fallback avec KernelExplainer (plus lente mais plus robuste)
+                    progress_text.text("🔬 Utilisation de KernelExplainer (méthode alternative)...")
+                    progress_bar.progress(50)
+                
+                    try:
+                        # Réduire encore plus l'échantillon pour KernelExplainer
+                        kernel_sample_size = min(100, X_test.shape[0])
+                        X_sample = X_test.sample(kernel_sample_size, random_state=42) if X_test.shape[0] > kernel_sample_size else X_test
+                    
+                        # Créer un background dataset plus petit
+                        background_size = min(50, kernel_sample_size)
+                        background = shap.sample(X_sample, background_size)
+                    
+                        # Créer l'explainer
+                        if hasattr(model, 'predict_proba'):
+                            kernel_explainer = shap.KernelExplainer(model.predict_proba, background)
+                        else:
+                            kernel_explainer = shap.KernelExplainer(model.predict, background)
+                    
+                        # Calculer les valeurs SHAP
+                        progress_text.text(f"🔄 Calcul SHAP sur {kernel_sample_size} échantillons...")
+                        progress_bar.progress(70)
+                    
+                        shap_values = kernel_explainer.shap_values(X_sample)
+                    
+                        progress_bar.progress(100)
+                        progress_text.text("✅ Calcul SHAP terminé (méthode alternative)!")
+                    
+                        # Nettoyer la mémoire après le calcul
+                        cleanup_memory()
+                    
+                        return shap_values
+                    
+                    except Exception as e2:
+                        st.error(f"❌ Toutes les méthodes ont échoué: {str(e2)}")
+                        progress_bar.empty()
+                        progress_text.empty()
+                    
+                        # Créer des valeurs SHAP factices pour éviter les erreurs
+                        st.warning("⚠️ Utilisation de valeurs approximatives pour la visualisation")
+                        dummy_values = np.random.normal(0, 0.01, (X_test.shape[0], X_test.shape[1]))
+                        return dummy_values
+        
+            except MemoryError:
+                st.error("❌ Erreur de mémoire insuffisante. Réduction automatique de la taille des données...")
+                if 'progress_bar' in locals():
+                    progress_bar.empty()
+                if 'progress_text' in locals():
+                    progress_text.empty()
+            
+                # Nettoyer agressivement la mémoire
+                cleanup_memory()
+                plt.close('all')
+            
+                # Réessayer avec un échantillon beaucoup plus petit
+                reduced_size = min(50, X_test.shape[0])
+                X_reduced = X_test.sample(reduced_size, random_state=42)
+            
+                # Appel récursif avec des paramètres plus restrictifs
+                return calculate_shap_values(model, X_reduced, model_name, 
+                                           max_samples=reduced_size, 
+                                           memory_limit_mb=memory_limit_mb * 2)  # Augmenter la limite pour éviter une boucle infinie
+            
+            except Exception as e:
+                st.error(f"❌ Erreur générale lors du calcul des valeurs SHAP: {str(e)}")
+                progress_bar.empty()
+                progress_text.empty()
+            
+                # Retourner des valeurs factices pour éviter les erreurs
+                dummy_values = np.zeros((min(100, len(X_test)), len(X_test.columns)))
+                return dummy_values
+        
+            finally:
+                # Nettoyer les éléments de progression
+                if 'progress_bar' in locals():
+                    progress_bar.empty()
+                if 'progress_text' in locals():
+                    progress_text.empty()
+            
+                # Forcer le nettoyage mémoire
+                cleanup_memory()
+
+        # Fonction pour extraire directement les importances du modèle Random Forest
+        def get_feature_importances_rf(model, feature_names):
+            """
+            Extrait les importances directement du modèle Random Forest.
+        
+            Args:
+                model: Modèle Random Forest
+                feature_names: Noms des features
+            
+            Returns:
+                DataFrame avec les importances triées
+            """
+            if not hasattr(model, 'feature_importances_'):
+                st.error("Le modèle ne possède pas d'attribut feature_importances_")
+                return None
+        
+            # Extraire les importances
+            importances = model.feature_importances_
+        
+            # Vérifier que les dimensions correspondent
+            if len(importances) != len(feature_names):
+                st.warning(f"Dimensions incorrectes: importances {len(importances)} vs features {len(feature_names)}")
+                # Ajuster si nécessaire
+                if len(importances) < len(feature_names):
+                    # Compléter avec des zéros
+                    importances = np.pad(importances, (0, len(feature_names) - len(importances)))
+                else:
+                    # Tronquer
+                    importances = importances[:len(feature_names)]
+        
+            # Créer un DataFrame
+            importance_df = pd.DataFrame({
+                'Feature': feature_names,
+                'Importance': importances
+            })
+        
             # Trier par importance décroissante
             importance_df = importance_df.sort_values('Importance', ascending=False)
+        
+            return importance_df
+
+        # Fonction pour créer les graphiques SHAP avec mise en cache
+        @st.cache_data
+        def create_importance_plot_rf(_shap_values_data, _feature_names, max_display=24, min_display=10):
+            """Crée un graphique d'importance des variables spécifiquement pour Random Forest."""
+            fig = plt.figure(figsize=(12, 8))  # Augmenter la taille pour plus de lisibilité
+            try:
+                # Convertir _feature_names en tableau NumPy
+                feature_names_array = np.array(_feature_names)
             
-            # Limiter aux max_display plus importantes features
-            top_features = importance_df.head(max_display)
-            
-            # S'assurer d'avoir au moins min_display features
-            if len(top_features) < min_display and len(importance_df) >= min_display:
-                top_features = importance_df.head(min_display)
-            
-            # Créer une palette de couleurs dégradées
-            colors = plt.cm.viridis(np.linspace(0, 0.8, len(top_features)))
-            
-            # Créer un graphique à barres horizontal avec des couleurs dégradées
-            bars = plt.barh(
-                y=top_features['Feature'],
-                width=top_features['Importance'],
-                color=colors
-            )
-            
-            # Ajouter les valeurs à côté des barres
-            for i, bar in enumerate(bars):
-                width = bar.get_width()
-                plt.text(width + width*0.01,  # Position légèrement à droite de la barre
-                        bar.get_y() + bar.get_height()/2,  # Position verticale centrée
-                        f'{width:.4f}',  # Formater avec 4 décimales
-                        ha='left', va='center',
-                        fontsize=9)
-            
-            # Inverser l'axe y pour avoir la feature la plus importante en haut
-            plt.gca().invert_yaxis()
-            
-            # Ajouter une grille horizontale pour faciliter la lecture
-            plt.grid(axis='x', linestyle='--', alpha=0.6)
-            
-            # Ajouter le titre et les labels
-            plt.title("Importance des features (Random Forest)",
-                    fontsize=20,
-                    fontstyle='italic')
-            plt.xlabel("Impact moyen sur la prédiction (valeur SHAP)")
-            
-            # Ajuster les marges
-            plt.tight_layout()
-            
-            return fig
-        except Exception as e:
-            st.error(f"Erreur d'affichage RF: {str(e)}")
-            # Créer un graphique d'erreur
-            plt.text(0.5, 0.5, f"Erreur d'affichage RF: {str(e)}", 
-                    horizontalalignment='center', verticalalignment='center',
-                    transform=plt.gca().transAxes)
-            
-            plt.title("Importance des features (Random Forest) - ERREUR",
-                    fontsize=20,
-                    fontstyle='italic',
-                    color='red')
-            plt.tight_layout()
-            return fig
-    
-    @st.cache_data
-    def create_importance_plot(_shap_values_data, _feature_names, max_display=24):
-        """Crée un graphique d'importance des variables pour les modèles."""
-        fig = plt.figure(figsize=(10, 6))
-        try:
-            # Convertir _feature_names en tableau NumPy pour éviter les problèmes d'indexation
-            feature_names_array = np.array(_feature_names)
-            
-            # Pour les modèles
-            shap.summary_plot(_shap_values_data, 
-                            plot_type="bar", 
-                            color='#39c5f2',
-                            max_display=max_display,
-                            feature_names=feature_names_array,
-                            show=False)
-        except Exception as e:
-            plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
-                    horizontalalignment='center', verticalalignment='center',
-                    transform=plt.gca().transAxes)
-            
-        plt.title("Importance des features dans la construction du modèle",
-                fontsize=20,
-                fontstyle='italic')
-        plt.tight_layout()
-        return fig
-    
-    @st.cache_data
-    def create_beeswarm_plot_rf(_shap_values_data, _feature_names, max_display=24):
-        """Crée un graphique BeeSwarm spécifiquement pour Random Forest."""
-        fig = plt.figure(figsize=(14, 8))
-        try:
-            # Convertir feature_names en array numpy
-            feature_names_array = np.array(_feature_names)
-            
-            # Pour Random Forest, nous devons traiter les valeurs SHAP différemment
-            # Extraire les valeurs SHAP pour la classe positive (indice 1 pour classification binaire)
-            if len(_shap_values_data) > 1:  # S'il y a plusieurs classes
-                shap_values_to_use = _shap_values_data[1]  # Utiliser la classe positive
-            else:
-                shap_values_to_use = _shap_values_data[0]
-            
-            # Calculer l'importance des features (moyenne des valeurs absolues)
-            feature_importance = np.abs(shap_values_to_use).mean(0)
-            
-            # Trier les indices par importance
-            sort_inds = np.argsort(feature_importance)
-            
-            # Limiter aux max_display plus importantes features
-            if sort_inds.size > max_display:
-                sort_inds = sort_inds[-max_display:]
-            
-            # Créer un DataFrame pour le plot
-            X_test_values = st.session_state.X_test.values
-            
-            # Créer un scatter plot pour chaque feature
-            for i, ind in enumerate(sort_inds):
-                # Position verticale (feature)
-                pos = len(sort_inds) - i - 1
-                
-                # Valeurs SHAP pour cette feature
-                shap_values_feature = shap_values_to_use[:, ind]
-                
-                # Valeurs de la feature
-                feature_values = X_test_values[:, ind]
-                
-                # Normaliser les valeurs de la feature pour la couleur
-                if np.max(feature_values) - np.min(feature_values) > 0:
-                    normalized_values = (feature_values - np.min(feature_values)) / (np.max(feature_values) - np.min(feature_values))
+                # Pour Random Forest, nous utilisons une approche manuelle plus robuste
+                # Extraire les valeurs SHAP pour la classe positive (indice 1 pour classification binaire)
+                if len(_shap_values_data) > 1:  # S'il y a plusieurs classes
+                    shap_values_to_use = _shap_values_data[1]  # Utiliser la classe positive
                 else:
-                    normalized_values = np.zeros_like(feature_values)
-                
-                # Créer un scatter plot
-                plt.scatter(
-                    shap_values_feature,
-                    np.ones(len(shap_values_feature)) * pos,
-                    c=normalized_values,
-                    cmap='coolwarm',
-                    alpha=0.8,
-                    s=20
+                    shap_values_to_use = _shap_values_data[0]
+            
+                # Calculer l'importance des features (moyenne des valeurs absolues)
+                feature_importance = np.abs(shap_values_to_use).mean(0)
+            
+                # Créer un DataFrame pour le tri et l'affichage
+                importance_df = pd.DataFrame({
+                    'Feature': feature_names_array,
+                    'Importance': feature_importance
+                })
+            
+                # Trier par importance décroissante
+                importance_df = importance_df.sort_values('Importance', ascending=False)
+            
+                # Limiter aux max_display plus importantes features
+                top_features = importance_df.head(max_display)
+            
+                # S'assurer d'avoir au moins min_display features
+                if len(top_features) < min_display and len(importance_df) >= min_display:
+                    top_features = importance_df.head(min_display)
+            
+                # Créer une palette de couleurs dégradées
+                from matplotlib import cm
+                colors = cm.get_cmap('viridis')(np.linspace(0, 0.8, len(top_features)))
+            
+                # Créer un graphique à barres horizontal avec des couleurs dégradées
+                bars = plt.barh(
+                    y=top_features['Feature'],
+                    width=top_features['Importance'],
+                    color=colors
                 )
             
-            # Ajouter les noms des features
-            plt.yticks(range(len(sort_inds)), [feature_names_array[ind] for ind in sort_inds])
+                # Ajouter les valeurs à côté des barres
+                for bar in bars:
+                    width = bar.get_width()
+                    plt.text(width + width*0.01,  # Position légèrement à droite de la barre
+                            bar.get_y() + bar.get_height()/2,  # Position verticale centrée
+                            f'{width:.4f}',  # Formater avec 4 décimales
+                            ha='left', va='center',
+                            fontsize=9)
             
-            # Ajouter une grille horizontale
-            plt.grid(axis='x', linestyle='--', alpha=0.6)
+                # Inverser l'axe y pour avoir la feature la plus importante en haut
+                plt.gca().invert_yaxis()
             
-            # Ajouter le titre et les labels
-            plt.title("Impact des features sur la prédiction (Random Forest)",
+                # Ajouter une grille horizontale pour faciliter la lecture
+                plt.grid(axis='x', linestyle='--', alpha=0.6)
+            
+                # Ajouter le titre et les labels
+                plt.title("Importance des features (Random Forest)",
+                        fontsize=20,
+                        fontstyle='italic')
+                plt.xlabel("Impact moyen sur la prédiction (valeur SHAP)")
+            
+                # Ajuster les marges
+                plt.tight_layout()
+            
+                return fig
+            except Exception as e:
+                st.error(f"Erreur d'affichage RF: {str(e)}")
+                # Créer un graphique d'erreur
+                plt.text(0.5, 0.5, f"Erreur d'affichage RF: {str(e)}", 
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=plt.gca().transAxes)
+            
+                plt.title("Importance des features (Random Forest) - ERREUR",
+                        fontsize=20,
+                        fontstyle='italic',
+                        color='red')
+                plt.tight_layout()
+                return fig
+    
+        @st.cache_data
+        def create_importance_plot(_shap_values_data, _feature_names, max_display=24):
+            """Crée un graphique d'importance des variables pour les modèles."""
+            fig = plt.figure(figsize=(10, 6))
+            try:
+                # Convertir _feature_names en tableau NumPy pour éviter les problèmes d'indexation
+                feature_names_array = np.array(_feature_names)
+            
+                # Pour les modèles
+                shap.summary_plot(_shap_values_data, 
+                                plot_type="bar", 
+                                color='#39c5f2',
+                                max_display=max_display,
+                                feature_names=feature_names_array,
+                                show=False)
+            except Exception as e:
+                plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=plt.gca().transAxes)
+            
+            plt.title("Importance des features dans la construction du modèle",
                     fontsize=20,
                     fontstyle='italic')
-            plt.xlabel("Impact sur la prédiction (valeur SHAP)")
-            
-            # Ajouter une barre de couleur
-            cbar = plt.colorbar()
-            cbar.set_label("Valeur de la feature (normalisée)")
-            
-            # Ajuster les marges
-            plt.tight_layout()
-            
-            return fig
-        except Exception as e:
-            st.error(f"Erreur d'affichage RF: {str(e)}")
-            # Créer un graphique d'erreur
-            plt.text(0.5, 0.5, f"Erreur d'affichage RF: {str(e)}", 
-                    horizontalalignment='center', verticalalignment='center',
-                    transform=plt.gca().transAxes)
-            
-            plt.title("BeeSwarm Plot (Random Forest) - ERREUR",
-                    fontsize=20,
-                    fontstyle='italic',
-                    color='red')
             plt.tight_layout()
             return fig
     
-    @st.cache_data
-    def create_beeswarm_plot(_shap_values_data, _feature_names, max_display=24):
-        """Crée un graphique BeeSwarm."""
-        fig = plt.figure(figsize=(14, 8))
-        try:
-            # Convertir feature_names en array numpy pour éviter les problèmes d'indexation
-            feature_names_array = np.array(_feature_names)
-            
-            # Pour les modèles autres que Random Forest
-            shap.summary_plot(
-                _shap_values_data,
-                st.session_state.X_test,
-                plot_type="dot",
-                max_display=max_display,
-                feature_names=feature_names_array,
-                show=False
-            )
-        except Exception as e:
-            st.error(f"Erreur lors de l'affichage du BeeSwarm plot: {str(e)}")
-            st.info("Tentative avec une méthode alternative...")
+        @st.cache_data
+        def create_beeswarm_plot_rf(_shap_values_data, _feature_names, max_display=24):
+            """Crée un graphique BeeSwarm spécifiquement pour Random Forest."""
+            fig = plt.figure(figsize=(14, 8))
             try:
-                # Méthode alternative plus simple
+                # Convertir feature_names en array numpy
+                feature_names_array = np.array(_feature_names)
+            
+                # Pour Random Forest, nous devons traiter les valeurs SHAP différemment
+                # Extraire les valeurs SHAP pour la classe positive (indice 1 pour classification binaire)
+                if len(_shap_values_data) > 1:  # S'il y a plusieurs classes
+                    shap_values_to_use = _shap_values_data[1]  # Utiliser la classe positive
+                else:
+                    shap_values_to_use = _shap_values_data[0]
+            
+                # Calculer l'importance des features (moyenne des valeurs absolues)
+                feature_importance = np.abs(shap_values_to_use).mean(0)
+            
+                # Trier les indices par importance
+                sort_inds = np.argsort(feature_importance)
+            
+                # Limiter aux max_display plus importantes features
+                if sort_inds.size > max_display:
+                    sort_inds = sort_inds[-max_display:]
+            
+                # Créer un DataFrame pour le plot
+                X_test_values = st.session_state.X_test.values
+            
+                # Créer un scatter plot pour chaque feature
+                for i, ind in enumerate(sort_inds):
+                    # Position verticale (feature)
+                    pos = len(sort_inds) - i - 1
+                
+                    # Valeurs SHAP pour cette feature
+                    shap_values_feature = shap_values_to_use[:, ind]
+                
+                    # Valeurs de la feature
+                    feature_values = X_test_values[:, ind]
+                
+                    # Normaliser les valeurs de la feature pour la couleur
+                    if np.max(feature_values) - np.min(feature_values) > 0:
+                        normalized_values = (feature_values - np.min(feature_values)) / (np.max(feature_values) - np.min(feature_values))
+                    else:
+                        normalized_values = np.zeros_like(feature_values)
+                
+                    # Créer un scatter plot
+                    plt.scatter(
+                        shap_values_feature,
+                        np.ones(len(shap_values_feature)) * pos,
+                        c=normalized_values,
+                        cmap='coolwarm',
+                        alpha=0.8,
+                        s=20
+                    )
+            
+                # Ajouter les noms des features
+                plt.yticks(range(len(sort_inds)), [feature_names_array[ind] for ind in sort_inds])
+            
+                # Ajouter une grille horizontale
+                plt.grid(axis='x', linestyle='--', alpha=0.6)
+            
+                # Ajouter le titre et les labels
+                plt.title("Impact des features sur la prédiction (Random Forest)",
+                        fontsize=20,
+                        fontstyle='italic')
+                plt.xlabel("Impact sur la prédiction (valeur SHAP)")
+            
+                # Ajouter une barre de couleur
+                cbar = plt.colorbar()
+                cbar.set_label("Valeur de la feature (normalisée)")
+            
+                # Ajuster les marges
+                plt.tight_layout()
+            
+                return fig
+            except Exception as e:
+                st.error(f"Erreur d'affichage RF: {str(e)}")
+                # Créer un graphique d'erreur
+                plt.text(0.5, 0.5, f"Erreur d'affichage RF: {str(e)}", 
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=plt.gca().transAxes)
+            
+                plt.title("BeeSwarm Plot (Random Forest) - ERREUR",
+                        fontsize=20,
+                        fontstyle='italic',
+                        color='red')
+                plt.tight_layout()
+                return fig
+    
+        @st.cache_data
+        def create_beeswarm_plot(_shap_values_data, _feature_names, max_display=24):
+            """Crée un graphique BeeSwarm."""
+            fig = plt.figure(figsize=(14, 8))
+            try:
+                # Convertir feature_names en array numpy pour éviter les problèmes d'indexation
+                feature_names_array = np.array(_feature_names)
+            
+                # Pour les modèles autres que Random Forest
                 shap.summary_plot(
                     _shap_values_data,
-                    st.session_state.X_test.values,
+                    st.session_state.X_test,
                     plot_type="dot",
-                    feature_names=_feature_names,
                     max_display=max_display,
+                    feature_names=feature_names_array,
                     show=False
                 )
-            except Exception as e2:
-                st.error(f"L'affichage alternatif a également échoué: {str(e2)}")
-                # Méthode de secours ultime - créer un graphique simple
+            except Exception as e:
+                st.error(f"Erreur lors de l'affichage du BeeSwarm plot: {str(e)}")
+                st.info("Tentative avec une méthode alternative...")
                 try:
-                    plt.figure(figsize=(14, 8))
-                    # Créer un DataFrame pour visualiser les valeurs SHAP moyennes
-                    mean_shap = np.abs(_shap_values_data).mean(0) if hasattr(_shap_values_data, 'mean') else np.abs(_shap_values_data.values).mean(0)
-                    
-                    shap_df = pd.DataFrame({
-                        'Feature': _feature_names,
-                        'SHAP Value': mean_shap
-                    })
-                    
-                    # Trier par valeur absolue
-                    shap_df = shap_df.sort_values('SHAP Value', ascending=False).head(max_display)
-                    
-                    # Créer un barplot
-                    plt.barh(y=shap_df['Feature'], width=shap_df['SHAP Value'], color='#39c5f2')
-                    plt.title("Importance des features (méthode de secours)", fontsize=14)
-                    plt.xlabel("Impact moyen sur la prédiction (valeur SHAP)")
-                except Exception as e3:
-                    plt.text(0.5, 0.5, f"Toutes les méthodes d'affichage ont échoué: {str(e3)}", 
-                            horizontalalignment='center', verticalalignment='center',
-                            transform=plt.gca().transAxes)
-        
-        # Ajuster la taille des étiquettes et l'apparence générale
-        ax = plt.gca()
-        # Réduire la taille de la police des étiquettes des variables
-        ax.tick_params(axis='y', labelsize=9)
-        # Augmenter la taille de la police des valeurs sur l'axe x
-        ax.tick_params(axis='x', labelsize=10)
-        
-        # Ajuster les marges pour éviter que les étiquettes ne soient coupées
-        plt.subplots_adjust(left=0.25, right=0.95, top=0.95, bottom=0.1)
-        
-        plt.title("Interprétation Globale BeeSwarm", 
-                fontsize=14, fontstyle='italic', fontweight='bold')
-        plt.tight_layout()
-        return fig
-    
-    @st.cache_data
-    def create_dependence_plot(_shap_values_data, _X_test_data, feature, _feature_names):
-        """Crée un graphique de dépendance."""
-        fig = plt.figure(figsize=(10, 6))
-        try:
-            # Convertir _feature_names en tableau NumPy pour éviter les problèmes d'indexation
-            feature_names_array = np.array(_feature_names)
-            
-            # Convertir _X_test_data en tableau NumPy
-            X_test_array = _X_test_data.values
-            
-            # Pour les modèles
-            shap.dependence_plot(feature, 
-                                _shap_values_data, 
-                                X_test_array, 
-                                interaction_index=None, 
-                                alpha=0.5,
-                                feature_names=feature_names_array,
-                                ax=plt.gca(),
-                                show=False)
-        except Exception as e:
-            plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
-                    horizontalalignment='center', verticalalignment='center',
-                    transform=plt.gca().transAxes)
-            
-        plt.title("Graphique de dépendance",
-                fontsize=11,
-                fontstyle='italic')
-        plt.tight_layout()
-        return fig
-    
-    @st.cache_data
-    def create_dependence_interaction_plot(_shap_values_data, _X_test_data, feature, interaction_feature, _feature_names):
-        """Crée un graphique de dépendance avec interaction."""
-        fig = plt.figure(figsize=(10, 6))
-        try:
-            # Convertir _feature_names en tableau NumPy pour éviter les problèmes d'indexation
-            feature_names_array = np.array(_feature_names)
-            
-            # Convertir _X_test_data en tableau NumPy
-            X_test_array = _X_test_data.values
-            
-            # Pour les modèles
-            shap.dependence_plot(feature, 
-                                _shap_values_data, 
-                                X_test_array, 
-                                interaction_index=interaction_feature, 
-                                alpha=0.5,
-                                feature_names=feature_names_array,
-                                ax=plt.gca(),
-                                show=False)
-        except Exception as e:
-            plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
-                    horizontalalignment='center', verticalalignment='center',
-                    transform=plt.gca().transAxes)
-            
-        plt.title("Graphique de dépendance et interaction",
-                fontsize=11,
-                fontstyle='italic')
-        plt.tight_layout()
-        return fig
-    
-    @st.cache_data
-    def create_waterfall_plot(_shap_values_data, observation_index):
-        """Crée un graphique Waterfall."""
-        fig = plt.figure(figsize=(10, 6))
-        try:
-            # Essayer d'utiliser la nouvelle API
-            if isinstance(_shap_values_data, list):
-                # Pour les modèles avec structure de liste
-                try:
-                    # Vérifier que l'index d'observation est valide
-                    if observation_index >= len(_shap_values_data[0]):
-                        observation_index = 0
-                        
-                    # Vérifier les dimensions
-                    shap_values_to_plot = _shap_values_data[0][observation_index]
-                    
-                    # Utiliser la nouvelle API
-                    shap.plots.waterfall(shap_values_to_plot, show=False)
-                except Exception as e:
-                    # Fallback sur l'ancienne API
-                    plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
-                            horizontalalignment='center', verticalalignment='center',
-                            transform=plt.gca().transAxes)
-            else:
-                # Pour les modèles avec structure simple
-                try:
-                    # Utiliser la nouvelle API
-                    shap.plots.waterfall(_shap_values_data[observation_index], show=False)
-                except Exception as e:
-                    # Fallback sur l'ancienne API
-                    plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
-                            horizontalalignment='center', verticalalignment='center',
-                            transform=plt.gca().transAxes)
-                    
-                    plt.xlabel("Impact sur la prédiction (valeur SHAP)")
-        except Exception as e:
-            plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
-                    horizontalalignment='center', verticalalignment='center',
-                    transform=plt.gca().transAxes)
-        
-        plt.title("Waterfall Plot", fontsize=11, fontstyle='italic')
-        plt.tight_layout()
-        return fig
-
-    # Menu pour charger le fichier pickle du modèle choisi
-    model_choice = st.selectbox("Choisissez un modèle", ["CatBoost", "XGBoost"])
-    
-    # Charger le modèle choisi
-    model = load_model(model_choice)
-    
-    if model is not None:
-        st.write(f"Modèle {model_choice} chargé avec succès.")
-        
-        # Charger ou calculer les valeurs SHAP
-        shap_values = load_shap_values(model_choice)
-        if shap_values is None:
-            with st.spinner(f"Calcul des valeurs SHAP pour le modèle {model_choice}..."):
-                shap_values = calculate_shap_values(model, st.session_state.X_test, model_choice)
-        
-        # Créer l'explainer une seule fois
-        explainer = shap.Explainer(model)
-        
-        # Sélectionner une valeur pour chaque feature de X_test
-        st.markdown("<div class='intro-header'>Sélection des valeurs des features</div>", unsafe_allow_html=True)
-        
-        # Option pour afficher toutes les variables ou seulement les plus importantes
-        show_all_features = st.checkbox("Afficher toutes les variables", value=False)
-        
-        # Définir les features à afficher
-        if show_all_features:
-            features_to_display = st.session_state.X_test.columns.tolist()
-        else:
-            # Utiliser un nombre limité de features pour l'interface utilisateur
-            features_to_display = ["catv", "place", "obsm", "choc", "manv", "col"]
-        
-        # Créer un conteneur pour les sélecteurs avec défilement si nécessaire
-        feature_container = st.container()
-        
-        # Utiliser des colonnes pour organiser les sélecteurs (3 colonnes)
-        if show_all_features:
-            # Avec beaucoup de variables, utiliser un layout plus compact
-            num_cols = 3
-            cols = feature_container.columns(num_cols)
-            
-            feature_values = {}
-            for i, feature in enumerate(features_to_display):
-                col_idx = i % num_cols
-                with cols[col_idx]:
-                    feature_values[feature] = st.selectbox(
-                        f"{feature}", 
-                        st.session_state.X_test[feature].unique(),
-                        key=f"feature_{feature}"
+                    # Méthode alternative plus simple
+                    shap.summary_plot(
+                        _shap_values_data,
+                        st.session_state.X_test.values,
+                        plot_type="dot",
+                        feature_names=_feature_names,
+                        max_display=max_display,
+                        show=False
                     )
-        else:
-            # Avec peu de variables, utiliser un layout plus spacieux
-            feature_values = {}
-            for feature in features_to_display:
-                if feature in st.session_state.X_test.columns:
-                    feature_values[feature] = st.selectbox(
-                        f"Valeur pour {feature}", 
-                        st.session_state.X_test[feature].unique(),
-                        key=f"feature_{feature}"
-                    )
+                except Exception as e2:
+                    st.error(f"L'affichage alternatif a également échoué: {str(e2)}")
+                    # Méthode de secours ultime - créer un graphique simple
+                    try:
+                        plt.figure(figsize=(14, 8))
+                        # Créer un DataFrame pour visualiser les valeurs SHAP moyennes
+                        mean_shap = np.abs(_shap_values_data).mean(0) if hasattr(_shap_values_data, 'mean') else np.abs(_shap_values_data.values).mean(0)
+                    
+                        shap_df = pd.DataFrame({
+                            'Feature': _feature_names,
+                            'SHAP Value': mean_shap
+                        })
+                    
+                        # Trier par valeur absolue
+                        shap_df = shap_df.sort_values('SHAP Value', ascending=False).head(max_display)
+                    
+                        # Créer un barplot
+                        plt.barh(y=shap_df['Feature'], width=shap_df['SHAP Value'], color='#39c5f2')
+                        plt.title("Importance des features (méthode de secours)", fontsize=14)
+                        plt.xlabel("Impact moyen sur la prédiction (valeur SHAP)")
+                    except Exception as e3:
+                        plt.text(0.5, 0.5, f"Toutes les méthodes d'affichage ont échoué: {str(e3)}", 
+                                horizontalalignment='center', verticalalignment='center',
+                                transform=plt.gca().transAxes)
         
-        # Compléter avec les valeurs par défaut pour les autres features
-        for feature in st.session_state.X_test.columns:
-            if feature not in feature_values:
-                feature_values[feature] = st.session_state.X_test[feature].iloc[0]
+            # Ajuster la taille des étiquettes et l'apparence générale
+            ax = plt.gca()
+            # Réduire la taille de la police des étiquettes des variables
+            ax.tick_params(axis='y', labelsize=9)
+            # Augmenter la taille de la police des valeurs sur l'axe x
+            ax.tick_params(axis='x', labelsize=10)
         
-        # Afficher la valeur prédite de 'gravite_accident'
-        predict_button = st.button("Prédire la gravité de l'accident")
+            # Ajuster les marges pour éviter que les étiquettes ne soient coupées
+            plt.subplots_adjust(left=0.25, right=0.95, top=0.95, bottom=0.1)
         
-        if predict_button:
-            selected_features = pd.DataFrame([feature_values])
-            predicted_value = model.predict(selected_features)
+            plt.title("Interprétation Globale BeeSwarm", 
+                    fontsize=14, fontstyle='italic', fontweight='bold')
+            plt.tight_layout()
+            return fig
+    
+        @st.cache_data
+        def create_dependence_plot(_shap_values_data, _X_test_data, feature, _feature_names):
+            """Crée un graphique de dépendance."""
+            fig = plt.figure(figsize=(10, 6))
+            try:
+                # Convertir _feature_names en tableau NumPy pour éviter les problèmes d'indexation
+                feature_names_array = np.array(_feature_names)
             
-            # Convertir la valeur numérique en libellé
-            prediction_label = "Indemne" if predicted_value[0] == 0 else "Blessé ou Tué"
-            prediction_color = "#3B82F6" if predicted_value[0] == 0 else "#EF4444"
+                # Convertir _X_test_data en tableau NumPy
+                X_test_array = _X_test_data.values
             
-            # Afficher le résultat avec un style amélioré
-            st.markdown(f"""
-            <div style="background-color: #f0f7ff; padding: 15px; border-radius: 10px; border-left: 5px solid {prediction_color};">
-                <h4 style="margin-top: 0;">Prédiction</h4>
-                <p style="font-size: 18px; font-weight: bold;">{predicted_value[0]} : {prediction_label}</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        # Menu pour afficher les graphiques d'interprétabilité (SHAP)
-        st.markdown("<div class='intro-header'>Interprétabilité globale du modèle</div>", unsafe_allow_html=True)
-        shap_choice = st.selectbox("Choisissez un graphique d'interprétabilité", 
-                                  ["Importance des variables", "BeeSwarm", "Dépendance", "Dépendance et interaction"])
-        
-        # Préparer les données pour les graphiques SHAP
-        feature_names = st.session_state.X_test.columns.tolist()
-        X_test_values = st.session_state.X_test.values
-        
-        # Afficher les graphiques d'interprétabilité globale
-        if shap_choice == "Importance des variables":
-            with st.spinner("Génération du graphique d'importance des variables..."):
-                # Utiliser la fonction pour CatBoost et XGBoost
-                fig = create_importance_plot(shap_values, feature_names, max_display=24)
-                st.pyplot(fig)
-                plt.close()
-        
-        elif shap_choice == "BeeSwarm":
-            with st.spinner("Génération du graphique BeeSwarm..."):
-                # Utiliser la fonction pour CatBoost et XGBoost
-                fig = create_beeswarm_plot(shap_values, feature_names, max_display=24)
-                st.pyplot(fig)
-                plt.close()
-        
-        elif shap_choice == "Dépendance":
-            feature = st.selectbox("Choisissez une feature", feature_names)
-            with st.spinner(f"Génération du graphique de dépendance pour {feature}..."):
-                # Créer une nouvelle figure pour éviter les problèmes de mise en cache
-                plt.figure(figsize=(10, 6))
-                
-                # Pour les modèles CatBoost et XGBoost
+                # Pour les modèles
                 shap.dependence_plot(feature, 
-                                    shap_values, 
-                                    st.session_state.X_test,
+                                    _shap_values_data, 
+                                    X_test_array, 
                                     interaction_index=None, 
                                     alpha=0.5,
-                                    feature_names=feature_names,
+                                    feature_names=feature_names_array,
                                     ax=plt.gca(),
                                     show=False)
-                
-                plt.title("Graphique de dépendance",
-                        fontsize=11,
-                        fontstyle='italic')
-                plt.tight_layout()
-                st.pyplot(plt.gcf())
-                plt.close()
+            except Exception as e:
+                plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=plt.gca().transAxes)
             
-        elif shap_choice == "Dépendance et interaction":
-            feature = st.selectbox("Choisissez une feature", feature_names, key="dep_feature")
-            interaction_feature = st.selectbox("Choisissez une feature d'interaction", 
-                                              feature_names, key="int_feature")
-            with st.spinner(f"Génération du graphique de dépendance et interaction pour {feature} et {interaction_feature}..."):
-                # Créer une nouvelle figure pour éviter les problèmes de mise en cache
-                plt.figure(figsize=(10, 6))
-                
-                # Pour les modèles CatBoost et XGBoost
+            plt.title("Graphique de dépendance",
+                    fontsize=11,
+                    fontstyle='italic')
+            plt.tight_layout()
+            return fig
+    
+        @st.cache_data
+        def create_dependence_interaction_plot(_shap_values_data, _X_test_data, feature, interaction_feature, _feature_names):
+            """Crée un graphique de dépendance avec interaction."""
+            fig = plt.figure(figsize=(10, 6))
+            try:
+                # Convertir _feature_names en tableau NumPy pour éviter les problèmes d'indexation
+                feature_names_array = np.array(_feature_names)
+            
+                # Convertir _X_test_data en tableau NumPy
+                X_test_array = _X_test_data.values
+            
+                # Pour les modèles
                 shap.dependence_plot(feature, 
-                                    shap_values, 
-                                    st.session_state.X_test, 
+                                    _shap_values_data, 
+                                    X_test_array, 
                                     interaction_index=interaction_feature, 
                                     alpha=0.5,
-                                    feature_names=feature_names,
+                                    feature_names=feature_names_array,
                                     ax=plt.gca(),
                                     show=False)
-                
-                plt.title("Graphique de dépendance et interaction",
-                        fontsize=11,
-                        fontstyle='italic')
-                plt.tight_layout()
-                st.pyplot(plt.gcf())
-                plt.close()
-        
-        # Menu pour afficher les graphiques d'interprétabilité locale
-        st.markdown("<div class='intro-header'>Interprétabilité locale du modèle</div>", unsafe_allow_html=True)
-        local_shap_choice = st.selectbox("Choisissez un graphique d'interprétabilité locale", 
-                                        ["Force Plot", "Waterfall Plot", "Decision Plot"])
-        
-        # Sélectionner l'index de l'observation du dataframe "X_test"
-        observation_index = st.number_input("Indiquez l'index de l'observation dans X_test", 
-                                           min_value=0, max_value=len(st.session_state.X_test)-1, step=1)
-        
-        if local_shap_choice == "Force Plot":
-            with st.spinner("Génération du Force Plot..."):
-                # Pour les modèles (CatBoost, XGBoost)
-                try:
-                    # Créer un HTML pour le force plot
-                    plt.figure(figsize=(10, 3))
-                    force_plot = shap.force_plot(
-                        base_value=explainer.expected_value,
-                        shap_values=shap_values[observation_index],
-                        features=st.session_state.X_test.iloc[observation_index,:],
-                        feature_names=feature_names,
-                        matplotlib=True,
-                        show=False
-                    )
-                    st.pyplot(plt.gcf())
-                    plt.close()
-                except Exception as e:
-                    st.error(f"Erreur lors de l'affichage du Force Plot: {str(e)}")
-                    st.info("Essai avec une méthode alternative...")
+            except Exception as e:
+                plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=plt.gca().transAxes)
+            
+            plt.title("Graphique de dépendance et interaction",
+                    fontsize=11,
+                    fontstyle='italic')
+            plt.tight_layout()
+            return fig
+    
+        @st.cache_data
+        def create_waterfall_plot(_shap_values_data, observation_index):
+            """Crée un graphique Waterfall."""
+            fig = plt.figure(figsize=(10, 6))
+            try:
+                # Essayer d'utiliser la nouvelle API
+                if isinstance(_shap_values_data, list):
+                    # Pour les modèles avec structure de liste
                     try:
-                        # Méthode alternative
-                        plt.figure(figsize=(10, 3))
+                        # Vérifier que l'index d'observation est valide
+                        if observation_index >= len(_shap_values_data[0]):
+                            observation_index = 0
                         
-                        # Créer un barplot simple au lieu d'un waterfall plot
-                        feature_names = st.session_state.X_test.columns.tolist()
-                        shap_values_to_plot = shap_values[observation_index]
-                        
-                        # Trier les valeurs SHAP par importance
-                        indices = np.argsort(np.abs(shap_values_to_plot))
-                        
-                        # Prendre les 10 features les plus importantes
-                        top_indices = indices[-10:]
-                        
-                        # Créer un barplot horizontal
-                        plt.barh(
-                            y=np.array(feature_names)[top_indices],
-                            width=shap_values_to_plot[top_indices],
-                            color=['#ff0d57' if x > 0 else '#1E88E5' for x in shap_values_to_plot[top_indices]]
-                        )
-                        
-                        plt.title("Alternative au Force Plot (Top 10 features)", fontsize=12)
+                        # Vérifier les dimensions
+                        shap_values_to_plot = _shap_values_data[0][observation_index]
+                    
+                        # Utiliser la nouvelle API
+                        shap.plots.waterfall(shap_values_to_plot, show=False)
+                    except Exception as e:
+                        # Fallback sur l'ancienne API
+                        plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
+                                horizontalalignment='center', verticalalignment='center',
+                                transform=plt.gca().transAxes)
+                else:
+                    # Pour les modèles avec structure simple
+                    try:
+                        # Utiliser la nouvelle API
+                        shap.plots.waterfall(_shap_values_data[observation_index], show=False)
+                    except Exception as e:
+                        # Fallback sur l'ancienne API
+                        plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
+                                horizontalalignment='center', verticalalignment='center',
+                                transform=plt.gca().transAxes)
+                    
                         plt.xlabel("Impact sur la prédiction (valeur SHAP)")
-                        plt.tight_layout()
-                        st.pyplot(plt.gcf())
-                        plt.close()
-                    except Exception as e2:
-                        st.error(f"L'affichage alternatif a échoué: {str(e2)}")
-                
-        elif local_shap_choice == "Waterfall Plot":
-            with st.spinner("Génération du Waterfall Plot..."):
-                # Pour les modèles CatBoost et XGBoost
-                try:
-                    # Créer un objet Explanation pour le waterfall plot
-                    plt.figure(figsize=(10, 6))
-                    
-                    # Créer un objet Explanation à partir des valeurs SHAP
-                    # Cette approche utilise directement les valeurs brutes pour créer un graphique alternatif
-                    feature_names = st.session_state.X_test.columns.tolist()
-                    shap_values_to_plot = shap_values[observation_index]
-                    
-                    # Trier les valeurs SHAP par importance
-                    indices = np.argsort(np.abs(shap_values_to_plot))
-                    
-                    # Prendre les 10 features les plus importantes
-                    top_indices = indices[-10:]
-                    
-                    # Créer un barplot horizontal
-                    plt.barh(
-                        y=np.array(feature_names)[top_indices],
-                        width=shap_values_to_plot[top_indices],
-                        color=['#ff0d57' if x > 0 else '#1E88E5' for x in shap_values_to_plot[top_indices]]
-                    )
-                    
-                    plt.title("Waterfall Plot (Top 10 features)", fontsize=12)
-                    plt.xlabel("Impact sur la prédiction (valeur SHAP)")
-                    plt.tight_layout()
-                    st.pyplot(plt.gcf())
-                    plt.close()
-                    
-                    # Afficher aussi la valeur de base et la somme des valeurs SHAP
-                    expected_value = explainer.expected_value
-                    if isinstance(expected_value, list) or isinstance(expected_value, np.ndarray):
-                        expected_value = expected_value[0]
-                    
-                    st.write(f"Valeur de base (expected value): {float(expected_value):.4f}")
-                    st.write(f"Somme des valeurs SHAP: {float(np.sum(shap_values_to_plot)):.4f}")
-                    st.write(f"Prédiction finale: {float(expected_value + np.sum(shap_values_to_plot)):.4f}")
-                    
-                except Exception as e:
-                    st.error(f"Erreur lors de l'affichage du Waterfall Plot: {str(e)}")
-                    st.info("Essai avec une méthode alternative...")
-                    try:
-                        # Méthode alternative
-                        plt.figure(figsize=(10, 6))
-                        
-                        # Créer un barplot simple au lieu d'un waterfall plot
-                        feature_names = st.session_state.X_test.columns.tolist()
-                        shap_values_to_plot = shap_values[observation_index]
-                        
-                        # Trier les valeurs SHAP par importance
-                        indices = np.argsort(np.abs(shap_values_to_plot))
-                        
-                        # Prendre les 10 features les plus importantes
-                        top_indices = indices[-10:]
-                        
-                        # Créer un barplot horizontal
-                        plt.barh(
-                            y=np.array(feature_names)[top_indices],
-                            width=shap_values_to_plot[top_indices],
-                            color=['#ff0d57' if x > 0 else '#1E88E5' for x in shap_values_to_plot[top_indices]]
-                        )
-                        
-                        plt.title("Alternative au Waterfall Plot (Top 10 features)", fontsize=12)
-                        plt.xlabel("Impact sur la prédiction (valeur SHAP)")
-                        plt.tight_layout()
-                        st.pyplot(plt.gcf())
-                        plt.close()
-                    except Exception as e2:
-                        st.error(f"L'affichage alternatif a échoué: {str(e2)}")
+            except Exception as e:
+                plt.text(0.5, 0.5, f"Erreur d'affichage: {str(e)}", 
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=plt.gca().transAxes)
         
-        elif local_shap_choice == "Decision Plot":
-            with st.spinner("Génération du Decision Plot..."):
-                # Decision Plot ne peut pas être mis en cache facilement, on l'affiche directement
-                
-                # Pour les modèles CatBoost et XGBoost
-                try:
-                    plt.figure(figsize=(10, 8))
-                    shap.decision_plot(
-                        explainer.expected_value,
-                        shap_values[observation_index],
-                        st.session_state.X_test.iloc[observation_index,:],
-                        feature_names=feature_names,
-                        show=False
-                    )
-                    plt.tight_layout()
-                    st.pyplot(plt.gcf())
-                except Exception as e:
-                    st.error(f"Erreur lors de l'affichage du Decision Plot: {str(e)}")
-                    st.info("Essai avec une méthode alternative...")
-                    try:
-                        # Méthode alternative
-                        plt.figure(figsize=(10, 8))
-                        shap.plots.decision(
-                            explainer.expected_value,
-                            shap_values[observation_index],
-                            st.session_state.X_test.iloc[observation_index,:],
-                            feature_names=feature_names,
-                            show=False
+            plt.title("Waterfall Plot", fontsize=11, fontstyle='italic')
+            plt.tight_layout()
+            return fig
+
+        # Menu pour charger le fichier pickle du modèle choisi
+        model_choice = st.selectbox("Choisissez un modèle", ["CatBoost", "XGBoost"])
+    
+        # Charger le modèle choisi avec gestion d'erreur
+        try:
+            model = load_model(model_choice)
+        except Exception as e:
+            st.error(f"❌ Erreur lors du chargement du modèle {model_choice} : {str(e)}")
+            model = None
+    
+        if model is not None:
+            st.write(f"✅ Modèle {model_choice} chargé avec succès.")
+        
+            try:
+                # Charger ou calculer les valeurs SHAP
+                shap_values = load_shap_values(model_choice)
+                if shap_values is None:
+                    with st.spinner(f"⏳ Calcul des valeurs SHAP pour le modèle {model_choice}..."):
+                        # Limiter le nombre d'échantillons pour SHAP si nécessaire
+                        max_shap_samples = 1000
+                        X_test_for_shap = st.session_state.X_test
+                        if len(X_test_for_shap) > max_shap_samples:
+                            st.info(f"📊 Utilisation de {max_shap_samples} échantillons pour le calcul SHAP (sur {len(X_test_for_shap)} disponibles)")
+                            X_test_for_shap = X_test_for_shap.sample(n=max_shap_samples, random_state=42)
+                    
+                        shap_values = calculate_shap_values(model, X_test_for_shap, model_choice)
+            
+                # Créer l'explainer une seule fois
+                explainer = shap.Explainer(model)
+            
+            except Exception as e:
+                st.error(f"❌ Erreur lors du calcul des valeurs SHAP : {str(e)}")
+                shap_values = None
+                explainer = None
+        
+            # Sélectionner une valeur pour chaque feature de X_test
+            st.markdown("<div class='intro-header'>Sélection des valeurs des features</div>", unsafe_allow_html=True)
+        
+            # Option pour afficher toutes les variables ou seulement les plus importantes
+            show_all_features = st.checkbox("Afficher toutes les variables", value=False)
+        
+            # Définir les features à afficher
+            if show_all_features:
+                features_to_display = st.session_state.X_test.columns.tolist()
+            else:
+                # Utiliser un nombre limité de features pour l'interface utilisateur
+                features_to_display = ["catv", "place", "obsm", "choc", "manv", "col"]
+        
+            # Créer un conteneur pour les sélecteurs avec défilement si nécessaire
+            feature_container = st.container()
+        
+            # Utiliser des colonnes pour organiser les sélecteurs (3 colonnes)
+            if show_all_features:
+                # Avec beaucoup de variables, utiliser un layout plus compact
+                num_cols = 3
+                cols = feature_container.columns(num_cols)
+            
+                feature_values = {}
+                for i, feature in enumerate(features_to_display):
+                    col_idx = i % num_cols
+                    with cols[col_idx]:
+                        feature_values[feature] = st.selectbox(
+                            f"{feature}", 
+                            list(st.session_state.X_test[feature].unique()),
+                            key=f"feature_{feature}"
                         )
-                        plt.tight_layout()
-                        st.pyplot(plt.gcf())
-                    except Exception as e2:
-                        st.error(f"L'affichage du Decision Plot a échoué: {str(e2)}")
+            else:
+                # Avec peu de variables, utiliser un layout plus spacieux
+                feature_values = {}
+                for feature in features_to_display:
+                    if feature in st.session_state.X_test.columns:
+                        feature_values[feature] = st.selectbox(
+                            f"Valeur pour {feature}", 
+                            list(st.session_state.X_test[feature].unique()),
+                            key=f"feature_{feature}"
+                        )
+        
+            # Compléter avec les valeurs par défaut pour les autres features
+            for feature in st.session_state.X_test.columns:
+                if feature not in feature_values:
+                    feature_values[feature] = st.session_state.X_test[feature].iloc[0]
+        
+            # Afficher la valeur prédite de 'gravite_accident'
+            predict_button = st.button("Prédire la gravité de l'accident")
+        
+            if predict_button:
+                selected_features = pd.DataFrame([feature_values])
+                predicted_value = model.predict(selected_features)
+            
+                # Convertir la valeur numérique en libellé
+                prediction_label = "Indemne" if predicted_value[0] == 0 else "Blessé ou Tué"
+                prediction_color = "#3B82F6" if predicted_value[0] == 0 else "#EF4444"
+            
+                # Afficher le résultat avec un style amélioré
+                st.markdown(f"""
+                <div style="background-color: #f0f7ff; padding: 15px; border-radius: 10px; border-left: 5px solid {prediction_color};">
+                    <h4 style="margin-top: 0;">Prédiction</h4>
+                    <p style="font-size: 18px; font-weight: bold;">{predicted_value[0]} : {prediction_label}</p>
+                </div>
+                """, unsafe_allow_html=True)
+        
+            # Menu pour afficher les graphiques d'interprétabilité (SHAP)
+            st.markdown("<div class='intro-header'>Interprétabilité globale du modèle</div>", unsafe_allow_html=True)
+        
+            # Vérifier que les valeurs SHAP sont disponibles
+            if shap_values is not None:
+                shap_choice = st.selectbox("Choisissez un graphique d'interprétabilité", 
+                                          ["Importance des variables", "BeeSwarm", "Dépendance", "Dépendance et interaction"])
+            
+                # Préparer les données pour les graphiques SHAP
+                feature_names = st.session_state.X_test.columns.tolist()
+                X_test_values = st.session_state.X_test.values
+            
+                # Afficher les graphiques d'interprétabilité globale
+                if shap_choice == "Importance des variables":
+                    with st.spinner("Génération du graphique d'importance des variables..."):
+                        try:
+                            # Utiliser la fonction pour CatBoost et XGBoost
+                            fig = create_importance_plot(shap_values, feature_names, max_display=24)
+                            st.pyplot(fig)
+                            plt.close()
+                        except Exception as e:
+                            st.error(f"❌ Erreur lors de la génération du graphique d'importance : {str(e)}")
+                            plt.close()  # S'assurer que la figure est fermée
+        
+                elif shap_choice == "BeeSwarm":
+                    with st.spinner("Génération du graphique BeeSwarm..."):
+                        try:
+                            # Utiliser la fonction pour CatBoost et XGBoost
+                            fig = create_beeswarm_plot(shap_values, feature_names, max_display=24)
+                            st.pyplot(fig)
+                            plt.close()
+                        except Exception as e:
+                            st.error(f"❌ Erreur lors de la génération du graphique BeeSwarm : {str(e)}")
+                            plt.close()  # S'assurer que la figure est fermée
+        
+                elif shap_choice == "Dépendance":
+                    feature = st.selectbox("Choisissez une feature", feature_names)
+                    with st.spinner(f"Génération du graphique de dépendance pour {feature}..."):
+                        try:
+                            # Créer une nouvelle figure pour éviter les problèmes de mise en cache
+                            plt.figure(figsize=(10, 6))
+                        
+                            # Pour les modèles CatBoost et XGBoost
+                            shap.dependence_plot(feature, 
+                                                shap_values, 
+                                                st.session_state.X_test,
+                                                interaction_index=None, 
+                                                alpha=0.5,
+                                                feature_names=feature_names,
+                                                ax=plt.gca(),
+                                                show=False)
+                        
+                            plt.title("Graphique de dépendance",
+                                    fontsize=11,
+                                    fontstyle='italic')
+                            plt.tight_layout()
+                            st.pyplot(plt.gcf())
+                            plt.close()
+                        except Exception as e:
+                            st.error(f"❌ Erreur lors de la génération du graphique de dépendance : {str(e)}")
+                            plt.close()  # S'assurer que la figure est fermée
+            
+                elif shap_choice == "Dépendance et interaction":
+                    feature = st.selectbox("Choisissez une feature", feature_names, key="dep_feature")
+                    interaction_feature = st.selectbox("Choisissez une feature d'interaction", 
+                                                      feature_names, key="int_feature")
+                    with st.spinner(f"Génération du graphique de dépendance et interaction pour {feature} et {interaction_feature}..."):
+                        try:
+                            # Créer une nouvelle figure pour éviter les problèmes de mise en cache
+                            plt.figure(figsize=(10, 6))
+                        
+                            # Pour les modèles CatBoost et XGBoost
+                            shap.dependence_plot(feature, 
+                                                shap_values, 
+                                                st.session_state.X_test, 
+                                                interaction_index=interaction_feature, 
+                                                alpha=0.5,
+                                                feature_names=feature_names,
+                                                ax=plt.gca(),
+                                                show=False)
+                        
+                            plt.title("Graphique de dépendance et interaction",
+                                    fontsize=11,
+                                    fontstyle='italic')
+                            plt.tight_layout()
+                            st.pyplot(plt.gcf())
+                            plt.close()
+                        except Exception as e:
+                            st.error(f"❌ Erreur lors de la génération du graphique de dépendance et interaction : {str(e)}")
+                            plt.close()  # S'assurer que la figure est fermée
+            else:
+                st.warning("⚠️ Les valeurs SHAP ne sont pas disponibles. Veuillez vérifier que le modèle a été chargé correctement.")
+        
+            # Menu pour afficher les graphiques d'interprétabilité locale
+            st.markdown("<div class='intro-header'>Interprétabilité locale du modèle</div>", unsafe_allow_html=True)
+        
+            # Vérifier que l'explainer et les valeurs SHAP sont disponibles
+            if explainer is not None and shap_values is not None:
+                local_shap_choice = st.selectbox("Choisissez un graphique d'interprétabilité locale", 
+                                                ["Force Plot", "Waterfall Plot", "Decision Plot"])
+            
+                # Sélectionner l'index de l'observation du dataframe "X_test"
+                observation_index = st.number_input("Indiquez l'index de l'observation dans X_test", 
+                                                   min_value=0, max_value=len(st.session_state.X_test)-1, step=1)
+        
+                if local_shap_choice == "Force Plot":
+                    with st.spinner("Génération du Force Plot..."):
+                        # Pour les modèles (CatBoost, XGBoost)
+                        try:
+                            # Créer un HTML pour le force plot
+                            plt.figure(figsize=(10, 3))
+                            force_plot = shap.force_plot(
+                                base_value=getattr(explainer, 'expected_value', 0),
+                                shap_values=shap_values[observation_index],
+                                features=st.session_state.X_test.iloc[observation_index],
+                                feature_names=feature_names,
+                                matplotlib=True,
+                                show=False
+                            )
+                            st.pyplot(plt.gcf())
+                            plt.close()
+                        except Exception as e:
+                            st.error(f"Erreur lors de l'affichage du Force Plot: {str(e)}")
+                            st.info("Essai avec une méthode alternative...")
+                            try:
+                                # Méthode alternative
+                                plt.figure(figsize=(10, 3))
+                            
+                                # Créer un barplot simple au lieu d'un waterfall plot
+                                feature_names = st.session_state.X_test.columns.tolist()
+                                shap_values_to_plot = shap_values[observation_index]
+                            
+                                # Trier les valeurs SHAP par importance
+                                indices = np.argsort(np.abs(shap_values_to_plot))
+                            
+                                # Prendre les 10 features les plus importantes
+                                top_indices = indices[-10:]
+                            
+                                # Créer un barplot horizontal
+                                plt.barh(
+                                    y=np.array(feature_names)[top_indices],
+                                    width=shap_values_to_plot[top_indices],
+                                    color=['#ff0d57' if x > 0 else '#1E88E5' for x in shap_values_to_plot[top_indices]]
+                                )
+                            
+                                plt.title("Alternative au Force Plot (Top 10 features)", fontsize=12)
+                                plt.xlabel("Impact sur la prédiction (valeur SHAP)")
+                                plt.tight_layout()
+                                st.pyplot(plt.gcf())
+                                plt.close()
+                            except Exception as e2:
+                                st.error(f"L'affichage alternatif a échoué: {str(e2)}")
+                
+                elif local_shap_choice == "Waterfall Plot":
+                    with st.spinner("Génération du Waterfall Plot..."):
+                        # Pour les modèles CatBoost et XGBoost
+                        try:
+                            # Créer un objet Explanation pour le waterfall plot
+                            plt.figure(figsize=(10, 6))
+                        
+                            # Créer un objet Explanation à partir des valeurs SHAP
+                            # Cette approche utilise directement les valeurs brutes pour créer un graphique alternatif
+                            feature_names = st.session_state.X_test.columns.tolist()
+                            shap_values_to_plot = shap_values[observation_index]
+                        
+                            # Trier les valeurs SHAP par importance
+                            indices = np.argsort(np.abs(shap_values_to_plot))
+                        
+                            # Prendre les 10 features les plus importantes
+                            top_indices = indices[-10:]
+                        
+                            # Créer un barplot horizontal
+                            plt.barh(
+                                y=np.array(feature_names)[top_indices],
+                                width=shap_values_to_plot[top_indices],
+                                color=['#ff0d57' if x > 0 else '#1E88E5' for x in shap_values_to_plot[top_indices]]
+                            )
+                        
+                            plt.title("Waterfall Plot (Top 10 features)", fontsize=12)
+                            plt.xlabel("Impact sur la prédiction (valeur SHAP)")
+                            plt.tight_layout()
+                            st.pyplot(plt.gcf())
+                            plt.close()
+                        
+                            # Afficher aussi la valeur de base et la somme des valeurs SHAP
+                            expected_value = getattr(explainer, 'expected_value', 0)
+                            if isinstance(expected_value, list) or isinstance(expected_value, np.ndarray):
+                                expected_value = expected_value[0]
+                        
+                            st.write(f"Valeur de base (expected value): {float(expected_value):.4f}")
+                            st.write(f"Somme des valeurs SHAP: {float(np.sum(shap_values_to_plot)):.4f}")
+                            st.write(f"Prédiction finale: {float(expected_value + np.sum(shap_values_to_plot)):.4f}")
+                        
+                        except Exception as e:
+                            st.error(f"Erreur lors de l'affichage du Waterfall Plot: {str(e)}")
+                        st.info("Essai avec une méthode alternative...")
+                        try:
+                            # Méthode alternative
+                            plt.figure(figsize=(10, 6))
+                        
+                            # Créer un barplot simple au lieu d'un waterfall plot
+                            feature_names = st.session_state.X_test.columns.tolist()
+                            shap_values_to_plot = shap_values[observation_index]
+                        
+                            # Trier les valeurs SHAP par importance
+                            indices = np.argsort(np.abs(shap_values_to_plot))
+                        
+                            # Prendre les 10 features les plus importantes
+                            top_indices = indices[-10:]
+                        
+                            # Créer un barplot horizontal
+                            plt.barh(
+                                y=np.array(feature_names)[top_indices],
+                                width=shap_values_to_plot[top_indices],
+                                color=['#ff0d57' if x > 0 else '#1E88E5' for x in shap_values_to_plot[top_indices]]
+                            )
+                        
+                            plt.title("Alternative au Waterfall Plot (Top 10 features)", fontsize=12)
+                            plt.xlabel("Impact sur la prédiction (valeur SHAP)")
+                            plt.tight_layout()
+                            st.pyplot(plt.gcf())
+                            plt.close()
+                        except Exception as e2:
+                            st.error(f"L'affichage alternatif a échoué: {str(e2)}")
+        
+                elif local_shap_choice == "Decision Plot":
+                    with st.spinner("Génération du Decision Plot..."):
+                        # Decision Plot ne peut pas être mis en cache facilement, on l'affiche directement
+                    
+                        # Pour les modèles CatBoost et XGBoost
+                        try:
+                            plt.figure(figsize=(10, 8))
+                            shap.decision_plot(
+                                getattr(explainer, 'expected_value', 0),
+                                shap_values[observation_index],
+                                st.session_state.X_test.iloc[observation_index],
+                                feature_names=feature_names,
+                                show=False
+                            )
+                            plt.tight_layout()
+                            st.pyplot(plt.gcf())
+                        except Exception as e:
+                            st.error(f"Erreur lors de l'affichage du Decision Plot: {str(e)}")
+                            st.info("Essai avec une méthode alternative...")
+                            try:
+                                # Méthode alternative
+                                plt.figure(figsize=(10, 8))
+                                shap.plots.decision(
+                                    getattr(explainer, 'expected_value', 0),
+                                        shap_values[observation_index],
+                                    st.session_state.X_test.iloc[observation_index,:],
+                                    feature_names=feature_names,
+                                    show=False
+                                )
+                                plt.tight_layout()
+                                st.pyplot(plt.gcf())
+                            except Exception as e2:
+                                st.error(f"L'affichage du Decision Plot a échoué: {str(e2)}")
+            else:
+                st.warning("⚠️ L'explainer ou les valeurs SHAP ne sont pas disponibles. Veuillez vérifier que le modèle a été chargé correctement.")
+    
+        # Nettoyage de la mémoire à la fin de la section Modélisation
+        try:
+            # Nettoyer les variables volumineuses qui ne sont plus nécessaires
+            if 'shap_values' in locals():
+                del shap_values
+            if 'explainer' in locals():
+                del explainer
+            if 'model' in locals():
+                del model
+        
+            # Forcer le garbage collection
+            cleanup_memory()
+        
+            # Nettoyer aussi les figures matplotlib
+            import matplotlib.pyplot as plt
+            plt.close('all')
+        
+            # Log mémoire finale
+            log_memory_usage("Fin de la section Modélisation")
+        
+            # Afficher un message de succès si tout s'est bien passé
+            final_memory = get_memory_usage()
+            if final_memory < 1500:  # Moins de 1.5GB utilisé
+                print(f"✅ Section Modélisation terminée avec succès. Mémoire utilisée : {final_memory:.0f} MB")
+        except Exception as cleanup_error:
+            # Ne pas afficher d'erreur pour le nettoyage, juste logger
+            print(f"Erreur lors du nettoyage mémoire : {str(cleanup_error)}")
+        
+    except MemoryError as e:
+        # Gestion spécifique des erreurs de mémoire
+        st.error("❌ Erreur de mémoire insuffisante dans la section Modélisation.")
+        st.info("💡 Veuillez recharger la page manuellement ou sélectionner moins de données.")
+        cleanup_memory()
+        st.stop()
+    except Exception as e:
+        # Gestion générale des autres erreurs
+        st.error(f"❌ Une erreur est survenue dans la section Modélisation : {str(e)}")
+        st.info("💡 Essayez de recharger la page ou de sélectionner un autre modèle.")
+        print(f"Erreur dans la section Modélisation : {str(e)}")
+        cleanup_memory()
+        cleanup_memory()
 
 if selected == "Conclusion":  # Conclusion
     # Contenu de la page de conclusion
@@ -2239,6 +2810,8 @@ if selected == "Chat":
         # Convertir la description en une représentation adaptée au modèle
         # Cette étape dépend de votre preprocessing (TF-IDF, embeddings, etc.)
         # Pour l'exemple, nous allons juste retourner une prédiction aléatoire
+        # Note: description parameter will be used when the actual model preprocessing is implemented
+        _ = description  # Mark as intentionally unused for now
         import random
         predictions = ["Indemne", "Blessé léger", "Blessé hospitalisé", "Tué"]
         return random.choice(predictions)

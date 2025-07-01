@@ -97,10 +97,24 @@ Thumbs.db
 # models/*.pt
 # models/*.pth
 
-# Data files (optional - uncomment if files are too large or sensitive)
-# data/*.csv
-# *.csv
+# Data files (too large for GitHub)
+data/20241031_accidents_Fr_19_22_AH_q.csv
+data/X_train.csv
+data/X_test.csv
+data/y_train.csv
+data/y_test.csv
+# Note: data/departements-france.csv is small and included
 
-# SHAP values (optional - uncomment if regenerated frequently)
-# *shap*.pkl
-# *shap*.pickle
+# Shapefile data (too large for GitHub)
+communes-20220101-shp/
+
+# Machine Learning Models (large files)
+models/*.pkl
+models/*.pickle
+
+# SHAP values
+*shap*.pkl
+*shap*.pickle
+
+# Temporary Streamlit folders
+.streamlit/

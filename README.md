@@ -25,7 +25,17 @@ Cette application Streamlit permet d'explorer et d'analyser les données d'accid
 - pip
 - Git
 
-### Installation des dépendances
+### Étapes d'installation
+
+1. Créer un environnement virtuel :
+```bash
+python -m venv st_venv
+source st_venv/bin/activate  # Sur Linux/macOS
+# ou
+st_venv\Scripts\activate  # Sur Windows
+```
+
+2. Installer les dépendances :
 ```bash
 pip install -r requirements.txt
 ```
@@ -39,6 +49,10 @@ apt-get update && apt-get install -y gdal-bin python-gdal
 ## Utilisation
 Pour lancer l'application :
 ```bash
+# Assurez-vous que l'environnement virtuel est activé
+source st_venv/bin/activate  # Sur Linux/macOS
+
+# Lancer Streamlit
 streamlit run app.py
 ```
 
@@ -46,25 +60,32 @@ L'application sera accessible à l'adresse : http://localhost:8501
 
 ## Optimisations de performance
 
-L'application a été optimisée pour améliorer les performances lors de la navigation entre les pages :
+L'application a été optimisée pour améliorer les performances et réduire l'utilisation mémoire :
 
-1. **Chargement paresseux des données** :
+1. **Gestion optimisée de la mémoire** :
+   - Optimisation automatique des types de données (int8/16/32, float16/32/64)
+   - Chargement sélectif des colonnes nécessaires
+   - Conversion des colonnes catégorielles pour réduire l'empreinte mémoire
+   - Garbage collection automatique après les opérations coûteuses
+
+2. **Chargement paresseux des données** :
    - Les données sont chargées uniquement lorsqu'elles sont nécessaires
    - Utilisation de `st.session_state` pour stocker les données entre les rechargements
+   - Lecture par chunks pour les gros fichiers CSV
 
-2. **Mise en cache des fonctions** :
+3. **Mise en cache des fonctions** :
    - Utilisation de `@st.cache_data` pour mettre en cache les résultats des fonctions coûteuses
    - Création de fonctions spécifiques pour chaque transformation de données
 
-3. **Modularisation du code** :
+4. **Modularisation du code** :
    - Séparation des fonctions de chargement, de préparation et d'affichage des données
    - Utilisation de fonctions typées pour améliorer la lisibilité et la maintenabilité
 
-4. **Optimisation des visualisations** :
+5. **Optimisation des visualisations** :
    - Utilisation d'images préchargées pour les visualisations statiques
    - Mise en cache des graphiques générés dynamiquement
 
-5. **Gestion efficace de l'état** :
+6. **Gestion efficace de l'état** :
    - Conservation de l'état de l'interface utilisateur entre les rechargements
    - Initialisation minimale au démarrage de l'application
 
@@ -73,9 +94,14 @@ L'application a été optimisée pour améliorer les performances lors de la nav
 ```
 Projet_Accidents/
 ├── app.py                              # Application Streamlit principale
+├── memory_optimization.py              # Module d'optimisation mémoire
 ├── requirements.txt                    # Dépendances Python
 ├── packages.txt                        # Dépendances système pour Streamlit Cloud
 ├── README.md                          # Documentation du projet
+├── DEPLOYMENT_GUIDE.md                # Guide de déploiement
+├── .streamlit/                        # Configuration Streamlit
+│   └── config.toml                    # Paramètres de configuration
+├── st_venv/                           # Environnement virtuel Python
 ├── data/                              # Données du projet
 │   ├── 20241031_accidents_Fr_19_22_AH_q.csv  # Données accidents 2019-2022
 │   ├── X_train.csv                    # Features d'entraînement
